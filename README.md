@@ -26,8 +26,11 @@ only include root.
 ## Build
 
 ```bash
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 && cmake --build build --config Release
+cmake -S . -B build -A x64 && cmake --build build --config Release
 ```
+
+No `-G`: CMake selects the newest installed Visual Studio. Pin it with
+`-G "Visual Studio 17 2022"` only if you have several and want a specific one.
 
 The binary lands in `build/Release/outriced.exe`. It resolves `sessions/`,
 `clips/`, `settings.json` and `tools/ffmpeg/` by walking up from the executable,

@@ -31,8 +31,18 @@ jobs:
       - name: Fetch libmpv
         run: powershell -ExecutionPolicy Bypass -File tools/fetch_mpv.ps1
 
+      # Diagnostics first: a generator or toolchain mismatch is otherwise a bare
+      # "could not find any instance of Visual Studio" with nothing to compare against.
+      - name: Toolchain info
+        run: |
+          cmake --version
+          cmake --help | Select-String 'Visual Studio'
+
+      # No -G on purpose. Pinning "Visual Studio 17 2022" breaks the moment the
+      # runner image ships a different Visual Studio, which is exactly what
+      # happened. CMake picks the newest one installed; -A still selects x64.
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release
