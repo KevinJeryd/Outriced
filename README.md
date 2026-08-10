@@ -23,6 +23,10 @@ tools/        packaging and dependency scripts
 Includes are folder-qualified (`#include "capture/recorder.h"`). `src/` is the
 only include root.
 
+`ARCHITECTURE.md` covers how the pieces fit together: the subprocess model, the
+four channels used to talk to ffmpeg, the capture pipelines, the threading model
+and the invariants worth knowing before changing anything.
+
 ## Build
 
 ```bash
