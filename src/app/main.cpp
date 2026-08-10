@@ -190,21 +190,51 @@ int main(int, char**) {
     bool        was_exporting       = false;
     int         last_resume_count   = 0;
 
+    // Redraw interval while the window is visible but unfocused. Nothing on
+    // screen changes faster than this when nobody is interacting with it.
+    constexpr Uint64 kUnfocusedRenderMs = 500;
+    Uint64           last_render_ms     = 0;
+
+    auto handle_event = [&](const SDL_Event& ev) {
+        ImGui_ImplSDL3_ProcessEvent(&ev);
+        if (ev.type == SDL_EVENT_QUIT) {
+            // Closing the window keeps the recorder alive in the tray.
+            SDL_HideWindow(g_window);
+            player.set_visible(false);
+        } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
+                   ev.window.windowID == SDL_GetWindowID(g_window)) {
+            SDL_HideWindow(g_window);
+            player.set_visible(false);
+        }
+    };
+
     bool running = true;
     while (running) {
+        // How long to sleep is a *polling* decision, not a rendering one. Several
+        // things are serviced once per iteration and their latency is this
+        // period: the tray's hotkey queue, the check that notices ffmpeg has
+        // died and starts a resume, and the overlay's readout. While recording,
+        // the hotkey being waited on is usually the stop, and slow death
+        // detection costs footage across the seam, so the period tightens.
+        //
+        // SDL_WaitEventTimeout rather than a sleep, because it returns the
+        // moment input arrives. A click on an unfocused window wakes it at once,
+        // so the timeout only governs how often the loop turns with no input.
+        //
+        // SDL_WindowFlags is 64-bit; narrowing it drops the high flags.
+        const SDL_WindowFlags flags = SDL_GetWindowFlags(g_window);
+        const bool hidden  = (flags & SDL_WINDOW_HIDDEN) != 0;
+        const bool focused = (flags & SDL_WINDOW_INPUT_FOCUS) != 0;
+
+        int wait_ms = 0;                 // focused: vsync already paces the loop
+        if (hidden)        wait_ms = 250;
+        else if (!focused) wait_ms = recorder.recording() ? 250 : 500;
+
         SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            ImGui_ImplSDL3_ProcessEvent(&ev);
-            if (ev.type == SDL_EVENT_QUIT) {
-                // Closing the window keeps the recorder alive in the tray.
-                SDL_HideWindow(g_window);
-                player.set_visible(false);
-            } else if (ev.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED &&
-                       ev.window.windowID == SDL_GetWindowID(g_window)) {
-                SDL_HideWindow(g_window);
-                player.set_visible(false);
-            }
-        }
+        if (wait_ms > 0 && SDL_WaitEventTimeout(&ev, wait_ms))
+            handle_event(ev);
+        while (SDL_PollEvent(&ev))
+            handle_event(ev);
 
         for (auto e : tray.poll()) {
             switch (e) {
@@ -267,10 +297,24 @@ int main(int, char**) {
             last_resume_count = 0;   // ready for the next session
         }
 
-        // Nothing to draw while hidden; idle cheaply so the tray stays light.
-        if ((SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN) != 0) {
-            SDL_Delay(60);
+        // Nothing to draw while hidden. The wait above already idled, so there
+        // is no sleep here; re-read the flag because an event may have just
+        // shown the window.
+        if ((SDL_GetWindowFlags(g_window) & SDL_WINDOW_HIDDEN) != 0)
             continue;
+
+        // Rendering is gated separately from the polling above, because the two
+        // want different rates. Polling has to stay brisk while recording;
+        // drawing does not, and drawing is the expensive half. Unfocused, this
+        // window shows a clock and an fps readout, so twice a second is ample
+        // however often the loop happens to turn.
+        //
+        // Focused, this is skipped entirely and vsync sets the pace, exactly as
+        // before.
+        if (!focused) {
+            const Uint64 now_ms = SDL_GetTicks();
+            if (now_ms - last_render_ms < kUnfocusedRenderMs) continue;
+            last_render_ms = now_ms;
         }
 
         ImGui_ImplSDLRenderer3_NewFrame();
