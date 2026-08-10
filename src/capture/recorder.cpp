@@ -299,7 +299,16 @@ bool Recorder::launch(const std::filesystem::path& file) {
         }
     }
 
-    arg(L"-movflags"); arg(L"+faststart");
+    // Deliberately NOT +faststart here, unlike clip export.
+    //
+    // faststart moves the MP4 index to the front of the file, which ffmpeg does
+    // by rewriting the entire output after encoding finishes. That is worth it
+    // for a 9 MB clip someone streams from Discord. A session is played locally
+    // by mpv, which reads the index wherever it is, and sessions are large: an
+    // hour at the default bitrate is roughly 5 GB. Rewriting that on stop takes
+    // far longer than the timeout in stop() allows, so the recording would be
+    // killed part-way through finalising and left unusable. Omitting the flag
+    // makes stopping near-instant regardless of how long the session ran.
     arg(current_file_.wstring());
 
     OC_LOG_I("[rec] backend={} encoder={} monitor={} {}x{}@{}",
@@ -473,6 +482,15 @@ std::optional<std::filesystem::path> Recorder::stop() {
 
     // 'q' rather than TerminateProcess, so ffmpeg writes the moov atom and the
     // MP4 is actually seekable.
+    //
+    // Without +faststart this is a short append of the index, so the timeouts
+    // below are generous rather than load-bearing. The elapsed time is logged
+    // because a slow finalise is exactly the symptom that would return if
+    // anything reintroduced a whole-file rewrite here.
+    LARGE_INTEGER f{}, t0{}, t1{};
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+
     ffmpeg_->write_stdin("q");
 
     if (!ffmpeg_->wait(10000)) {
@@ -483,8 +501,13 @@ std::optional<std::filesystem::path> Recorder::stop() {
             ffmpeg_->terminate();
             ffmpeg_->wait(2000);
             last_error_ = "ffmpeg did not exit cleanly; the file may be truncated";
+            OC_LOG_E("[rec] ffmpeg had to be terminated; output may be truncated");
         }
     }
+
+    QueryPerformanceCounter(&t1);
+    OC_LOG_I("[rec] finalise took {} ms",
+             (long long)((t1.QuadPart - t0.QuadPart) * 1000 / f.QuadPart));
 
     ffmpeg_.reset();
     for (auto& a : audio_) if (a) a->stop();
