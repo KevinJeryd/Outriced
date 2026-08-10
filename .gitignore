@@ -1,0 +1,25 @@
+﻿# Build output
+build/
+out/
+dist/
+
+# Vendored dependencies, fetched by CMake or tools/fetch_mpv.ps1
+third_party/
+tools/ffmpeg/
+
+# Recordings, clips and their caches
+sessions/
+clips/
+*.mp4
+*.mkv
+
+# Per-machine configuration and diagnostics
+settings.json
+logs/
+*.dmp
+
+# Editor and tooling
+compile_commands.json
+.vs/
+.vscode/ipch/
+*.user
