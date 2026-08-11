@@ -26,7 +26,10 @@ struct EncoderInfo {
 //
 // Cuda and Qsv could not be verified without that hardware, so resolve_backend
 // probes them at runtime and silently falls back to Ddagrab if they fail.
-enum class CaptureBackend { Auto, Amf, Cuda, Qsv, Ddagrab };
+//   Native  - our own Desktop Duplication thread, feeding ffmpeg NV12 over a
+//             pipe. The only backend that emits on a strict timing grid, which
+//             is what motion smoothness actually depends on; see VideoCapture.
+enum class CaptureBackend { Auto, Native, Amf, Cuda, Qsv, Ddagrab };
 
 std::string to_string(CaptureBackend b);
 CaptureBackend capture_backend_from_string(std::string_view s);
@@ -52,9 +55,14 @@ struct CapturePipeline {
     std::string encoder;           // the encoder this pipeline's frames suit
 };
 
+// `poll_framerate` is how often the ddagrab-based backends ask the display for
+// a new frame; 0 means "the same as framerate". Asking faster than the output
+// rate is what stops frames being missed outright. See
+// Settings::capture_poll_multiplier for the measurements behind it.
 CapturePipeline build_pipeline(CaptureBackend backend, int monitor_index,
                                int framerate, int width, int height,
-                               bool draw_mouse, const std::string& encoder);
+                               bool draw_mouse, const std::string& encoder,
+                               int poll_framerate = 0);
 
 // Runs the backend's real filter chain for a few frames against the given
 // monitor. This is the only trustworthy test: a filter can be compiled in and

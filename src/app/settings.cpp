@@ -79,6 +79,8 @@ Settings Settings::load(const std::filesystem::path& file) {
     get("session_bitrate_kbps", s.session_bitrate_kbps);
     get("capture_audio",        s.capture_audio);
     get("draw_mouse",           s.draw_mouse);
+    get("fps_mode",             s.fps_mode);
+    get("capture_poll_multiplier", s.capture_poll_multiplier);
     get("audio_outputs",        s.audio_outputs);
     get("audio_input",          s.audio_input);
     get("audio_track_mode",     s.audio_track_mode);
@@ -120,6 +122,8 @@ void Settings::save(const std::filesystem::path& file) const {
         {"session_bitrate_kbps", session_bitrate_kbps},
         {"capture_audio",        capture_audio},
         {"draw_mouse",           draw_mouse},
+        {"fps_mode",             fps_mode},
+        {"capture_poll_multiplier", capture_poll_multiplier},
         {"audio_outputs",        audio_outputs},
         {"audio_input",          audio_input},
         {"audio_track_mode",     audio_track_mode},

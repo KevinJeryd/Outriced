@@ -11,6 +11,7 @@
 namespace oc {
 
 class AudioCapture;
+class VideoCapture;
 class Process;
 
 class Recorder {
@@ -77,6 +78,8 @@ private:
     // One per recorded endpoint: each streams into its own pipe and becomes its
     // own ffmpeg input, so they can be mixed or kept as separate tracks.
     std::vector<std::unique_ptr<AudioCapture>> audio_;
+    // Non-null only on the native backend; the others capture inside ffmpeg.
+    std::unique_ptr<VideoCapture> video_;
     std::filesystem::path         current_file_;
     long long                     start_tick_ = 0;
     std::string                   last_error_;

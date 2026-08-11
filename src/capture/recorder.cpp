@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "capture/audio_capture.h"
+#include "capture/video_capture.h"
 #include "capture/encoders.h"
 #include "platform/log.h"
 #include "platform/subprocess.h"
@@ -118,14 +119,68 @@ bool Recorder::launch(const std::filesystem::path& file) {
         last_error_ = "no audio device could be opened; recording video only";
 
     const Vendor vendor = detect_vendor();
-    const CaptureBackend backend =
+    CaptureBackend backend =
         resolve_backend(capture_backend_from_string(s.capture_backend), vendor,
                         ffmpeg, s.monitor_index);
+
+    // Native capture runs in this process and hands ffmpeg finished NV12 frames,
+    // so it has to be up before the command line can be built: the frame size it
+    // resolves decides the -s flag, and its pipe is input 0.
+    std::wstring video_pipe;
+    video_.reset();
+    if (backend == CaptureBackend::Native) {
+        video_pipe = L"\\\\.\\pipe\\oc_video_" + std::to_wstring(GetCurrentProcessId()) +
+                     L"_" + std::to_wstring(resumes_);
+        VideoCapture::Config vc;
+        vc.monitor_index = s.monitor_index;
+        vc.width         = s.capture_width;
+        vc.height        = s.capture_height;
+        vc.framerate     = s.framerate;
+
+        auto vcap = std::make_unique<VideoCapture>();
+        if (vcap->start(video_pipe, vc)) {
+            video_ = std::move(vcap);
+        } else {
+            // Another capture tool holding the monitor, or a GPU without a
+            // video processor. Falling back keeps recording working rather than
+            // failing outright on a backend that is still new.
+            OC_LOG_W("[rec] native capture unavailable ({}); falling back to ddagrab",
+                     vcap->error());
+            backend = CaptureBackend::Ddagrab;
+        }
+    }
+    const bool native = video_ != nullptr;
     backend_ = to_string(backend);
 
+    // Polling only means anything to the ffmpeg-side backends, where ddagrab is
+    // asked to produce frames at a chosen rate. Native capture blocks on the
+    // duplication API instead and takes frames as the desktop presents them, so
+    // there is no rate to choose and the setting is left out of it entirely.
+    int poll_mult = 1;
+    if (!native) {
+        // Clamped rather than trusted: the setting is hand-editable, and a wild
+        // multiplier costs a readback per poll for frames that do not exist.
+        poll_mult = std::clamp(s.capture_poll_multiplier, 1, 4);
+
+        // Oversampling only works because cfr's -r decimates back onto the
+        // target grid, picking the freshest frame per slot. Under vfr nothing
+        // decimates, so the multiplier would instead raise the recorded frame
+        // rate and split the same bitrate across two or three times as many
+        // frames. That reads as a collapse in image quality, not as smoother
+        // motion.
+        if (poll_mult != 1 && s.fps_mode == "vfr") {
+            OC_LOG_W("[rec] fps_mode=vfr does not decimate; ignoring {}x capture polling",
+                     poll_mult);
+            poll_mult = 1;
+        }
+        if (poll_mult != 1)
+            OC_LOG_I("[rec] polling capture at {} Hz for {} fps output ({}x)",
+                     s.framerate * poll_mult, s.framerate, poll_mult);
+    }
     const auto pipeline = build_pipeline(backend, s.monitor_index, s.framerate,
                                          s.capture_width, s.capture_height,
-                                         s.draw_mouse, s.encoder);
+                                         s.draw_mouse, s.encoder,
+                                         s.framerate * poll_mult);
 
     std::wstring cmd;
     auto arg = [&](const std::wstring& a) { cmd += quote_arg(a); cmd += L' '; };
@@ -146,14 +201,31 @@ bool Recorder::launch(const std::filesystem::path& file) {
     arg(L"-stats_period"); arg(L"0.5");
 
     // Video
-    arg(L"-init_hw_device"); arg(to_wide(pipeline.hw_device));
-    if (!pipeline.filter_hw_device.empty()) {
-        arg(L"-filter_hw_device"); arg(to_wide(pipeline.filter_hw_device));
+    if (!native) {
+        arg(L"-init_hw_device"); arg(to_wide(pipeline.hw_device));
+        if (!pipeline.filter_hw_device.empty()) {
+            arg(L"-filter_hw_device"); arg(to_wide(pipeline.filter_hw_device));
+        }
+    } else {
+        // Frames are already scaled and converted, so ffmpeg only demuxes them.
+        // -framerate stamps the input, and since VideoCapture emits on a strict
+        // grid those timestamps are the real ones rather than an assumption.
+        // The rawvideo demuxer's own option names, not the generic -pix_fmt/-s
+        // aliases, so there is no ambiguity about which stage they apply to.
+        arg(L"-thread_queue_size"); arg(L"64");
+        arg(L"-f");            arg(L"rawvideo");
+        arg(L"-pixel_format"); arg(L"nv12");
+        arg(L"-video_size");   arg(std::to_wstring(video_->width()) + L"x" +
+                                   std::to_wstring(video_->height()));
+        arg(L"-framerate");    arg(std::to_wstring(s.framerate));
+        arg(L"-i");            arg(video_pipe);
     }
 
-    // The video source is a filter, not a file, so the audio pipes are inputs
-    // 0..N-1. Everything gets an explicit label and -map once there is more than
-    // one audio stream, because ffmpeg's automatic mapping picks a single track.
+    // With native capture the video pipe is input 0 and audio follows it;
+    // otherwise the video source is a filter and the audio pipes start at 0.
+    // Everything gets an explicit label and -map once there is more than one
+    // audio stream, because ffmpeg's automatic mapping picks a single track.
+    const size_t audio_base = native ? 1 : 0;
     const size_t n_audio  = audio_.size();
     const bool   separate = s.audio_track_mode == "separate";
     const int    mic_gain = std::clamp(s.mic_gain_percent, 0, 400);
@@ -164,7 +236,8 @@ bool Recorder::launch(const std::filesystem::path& file) {
         n_audio == (s.audio_outputs.empty() ? 1u : s.audio_outputs.size()) + 1u;
 
     std::ostringstream fc;
-    fc << pipeline.filter_chain << "[v]";
+    if (native) fc << "[0:v]null[v]";
+    else        fc << pipeline.filter_chain << "[v]";
 
     if (n_audio > 0) {
         // Microphone gain is applied per-source, before any mixing.
@@ -172,7 +245,7 @@ bool Recorder::launch(const std::filesystem::path& file) {
         const size_t mic_index = n_audio - 1;
         for (size_t i = 0; i < n_audio; ++i) {
             const bool is_mic = has_mic && i == mic_index;
-            fc << ";[" << i << ":a]";
+            fc << ";[" << (i + audio_base) << ":a]";
 
             std::string chain;
             if (is_mic) {
@@ -217,13 +290,12 @@ bool Recorder::launch(const std::filesystem::path& file) {
         arg(L"-i");   arg(pipe_names[i]);
     }
 
-    // Neither backend reliably delivers a full 60 unique frames at 4K, so the
-    // stream would otherwise be variable-rate and short on frames. Padding to a
-    // constant rate duplicates the shortfall instead, which keeps timestamps
-    // honest and makes the -ss/-t seeking used by clip export land where the
-    // scrubber said it would.
-    arg(L"-fps_mode"); arg(L"cfr");
-    arg(L"-r"); arg(std::to_wstring(s.framerate));
+    // See Settings::fps_mode for the trade-off. Under cfr the frame rate is
+    // pinned with -r; under vfr that would defeat the point, so the rate is left
+    // to the capture source and only the ceiling is implied by the filter graph.
+    const bool cfr = s.fps_mode != "vfr";
+    arg(L"-fps_mode"); arg(cfr ? L"cfr" : L"vfr");
+    if (cfr) { arg(L"-r"); arg(std::to_wstring(s.framerate)); }
 
     // With two inputs, ffmpeg will hold back one stream to keep the interleave
     // tight if the other falls behind. That is the wrong trade here: a stalled
@@ -324,7 +396,9 @@ bool Recorder::launch(const std::filesystem::path& file) {
         ffmpeg_.reset();
         for (auto& a : audio_) if (a) a->stop();
         audio_.clear();
+        video_.reset();
         return false;
+
     }
     OC_LOG_I("[rec] recording to {}", current_file_.string());
     segments_.push_back(current_file_);
@@ -365,6 +439,7 @@ void Recorder::refresh_progress() {
         ffmpeg_.reset();
         for (auto& a : audio_) if (a) a->stop();
         audio_.clear();
+        video_.reset();
 
         // A segment that died almost immediately means the display is still
         // changing, so wait longer before the next attempt. One that ran for a
@@ -491,6 +566,17 @@ std::optional<std::filesystem::path> Recorder::stop() {
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&t0);
 
+    // With native capture ffmpeg's video comes from a pipe we own, so the clean
+    // ending is to close it: ffmpeg reaches EOF on input 0, drains what it has
+    // and writes the moov atom by itself. Sending 'q' while still feeding it
+    // frames does not work -- ffmpeg stayed wedged for the full 15 s timeout and
+    // had to be terminated, truncating the file. The in-ffmpeg backends still
+    // need 'q', because their capture filter never ends on its own.
+    if (video_) {
+        video_->stop();
+        for (auto& a : audio_) if (a) a->stop();
+    }
+
     ffmpeg_->write_stdin("q");
 
     if (!ffmpeg_->wait(10000)) {
@@ -512,6 +598,12 @@ std::optional<std::filesystem::path> Recorder::stop() {
     ffmpeg_.reset();
     for (auto& a : audio_) if (a) a->stop();
     audio_.clear();
+    if (video_) {
+        OC_LOG_I("[rec] capture: {} frames sent, {} repeated, {} dropped, {} resets",
+                 video_->emitted(), video_->duplicated(), video_->dropped(),
+                 video_->resets());
+        video_.reset();
+    }
 
     std::error_code ec;
     if (!progress_file_.empty()) {

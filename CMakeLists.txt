@@ -53,6 +53,7 @@ target_sources(outriced PRIVATE
     src/app/main.cpp
     src/app/settings.cpp
     src/capture/audio_capture.cpp
+    src/capture/video_capture.cpp
     src/capture/recorder.cpp
     src/media/sessions.cpp
     src/media/clipper.cpp
@@ -126,6 +127,7 @@ add_executable(record_test
     tests/record_test.cpp
     src/capture/recorder.cpp
     src/capture/audio_capture.cpp
+    src/capture/video_capture.cpp
     src/capture/audio_devices.cpp
     src/platform/subprocess.cpp
     src/app/settings.cpp
@@ -134,7 +136,7 @@ add_executable(record_test
     src/platform/log.cpp
 )
 target_include_directories(record_test PRIVATE src)
-target_link_libraries(record_test PRIVATE nlohmann_json::nlohmann_json ole32 avrt)
+target_link_libraries(record_test PRIVATE nlohmann_json::nlohmann_json ole32 avrt d3d11 dxgi)
 target_compile_definitions(record_test PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 add_executable(clip_test

@@ -16,6 +16,7 @@ std::string to_string(CaptureBackend b) {
     case CaptureBackend::Amf:     return "amf";
     case CaptureBackend::Cuda:    return "cuda";
     case CaptureBackend::Qsv:     return "qsv";
+    case CaptureBackend::Native:  return "native";
     case CaptureBackend::Ddagrab: return "ddagrab";
     default:                      return "auto";
     }
@@ -25,19 +26,30 @@ CaptureBackend capture_backend_from_string(std::string_view s) {
     if (s == "amf")     return CaptureBackend::Amf;
     if (s == "cuda")    return CaptureBackend::Cuda;
     if (s == "qsv")     return CaptureBackend::Qsv;
+    if (s == "native")  return CaptureBackend::Native;
     if (s == "ddagrab") return CaptureBackend::Ddagrab;
     return CaptureBackend::Auto;
 }
 
 CapturePipeline build_pipeline(CaptureBackend backend, int monitor_index,
                                int framerate, int width, int height,
-                               bool draw_mouse, const std::string& encoder) {
+                               bool draw_mouse, const std::string& encoder,
+                               int poll_framerate) {
     CapturePipeline p;
     p.encoder = encoder;
     const bool scaling = width > 0 && height > 0;
+    // Only the ddagrab paths poll; vsrc_amf waits on the compositor instead.
+    const int poll = poll_framerate > 0 ? poll_framerate : framerate;
     std::ostringstream f;
 
     switch (backend) {
+    case CaptureBackend::Native:
+        // Nothing to build: frames arrive as rawvideo NV12 on a pipe, so there
+        // is no capture filter and no hardware device for ffmpeg to open. The
+        // recorder adds the input flags itself. See VideoCapture.
+        if (p.encoder.empty()) p.encoder = "libx264";
+        return p;
+
     case CaptureBackend::Amf:
         // AMD's own capture source hands AMF surfaces straight down the chain,
         // so no frame ever leaves the GPU. wait_for_present ties capture to the
@@ -57,7 +69,7 @@ CapturePipeline build_pipeline(CaptureBackend backend, int monitor_index,
         // for NVENC. scale_cuda does the BGRA to NV12 conversion on the GPU.
         p.hw_device = "d3d11va=dx";
         f << "ddagrab=output_idx=" << monitor_index
-          << ":framerate=" << framerate
+          << ":framerate=" << poll
           << ":draw_mouse=" << (draw_mouse ? 1 : 0)
           << ",hwmap=derive_device=cuda,scale_cuda=";
         if (scaling) f << "w=" << width << ":h=" << height << ":";
@@ -68,7 +80,7 @@ CapturePipeline build_pipeline(CaptureBackend backend, int monitor_index,
     case CaptureBackend::Qsv:
         p.hw_device = "d3d11va=dx";
         f << "ddagrab=output_idx=" << monitor_index
-          << ":framerate=" << framerate
+          << ":framerate=" << poll
           << ":draw_mouse=" << (draw_mouse ? 1 : 0)
           << ",hwmap=derive_device=qsv,scale_qsv=";
         if (scaling) f << "w=" << width << ":h=" << height << ":";
@@ -78,12 +90,17 @@ CapturePipeline build_pipeline(CaptureBackend backend, int monitor_index,
 
     default:
         // ddagrab hands out BGRA D3D11 frames that every GPU-side consumer on
-        // the development machine rejected, so these come back to system memory
-        // for the colour conversion. That readback is the whole cost of this
-        // path: well over a full CPU core at 4K.
+        // the development machine rejected (scale_d3d11 and vpp_amf both refuse
+        // RGB; the vulkan route needs D3D11 interop this build lacks), so these
+        // come back to system memory for the colour conversion.
+        //
+        // The readback is not free but it is not the limit either. Staged at 4K
+        // against a 60 fps source: capture alone 59.3 fps, plus readback 55.7,
+        // plus scale/convert 54.2, plus encode 54.2. Most of what is lost goes
+        // missing at capture, which is what `poll` above addresses.
         p.hw_device = "d3d11va";
         f << "ddagrab=output_idx=" << monitor_index
-          << ":framerate=" << framerate
+          << ":framerate=" << poll
           << ":draw_mouse=" << (draw_mouse ? 1 : 0)
           << ",hwdownload,format=bgra";
         if (scaling) f << ",scale=" << width << ":" << height << ":flags=bilinear";
@@ -190,6 +207,9 @@ bool backend_works(const std::filesystem::path& ffmpeg, CaptureBackend backend,
                    int monitor_index) {
     if (!std::filesystem::exists(ffmpeg)) return false;
     if (backend == CaptureBackend::Auto) return false;
+    // Native capture is not an ffmpeg filter, so there is no graph to probe.
+    // VideoCapture::start() reports its own failure and the recorder falls back.
+    if (backend == CaptureBackend::Native) return true;
 
     const auto p = build_pipeline(backend, monitor_index, 60, 640, 360, false, "");
 
@@ -214,20 +234,14 @@ CaptureBackend resolve_backend(CaptureBackend requested, Vendor vendor,
                                const std::filesystem::path& ffmpeg, int monitor_index) {
     if (requested != CaptureBackend::Auto) return requested;
 
-    // Try the vendor's on-GPU path, but only trust it if it actually runs here.
-    CaptureBackend preferred = CaptureBackend::Ddagrab;
-    switch (vendor) {
-    case Vendor::Amd:    preferred = CaptureBackend::Amf;  break;
-    case Vendor::Nvidia: preferred = CaptureBackend::Cuda; break;
-    case Vendor::Intel:  preferred = CaptureBackend::Qsv;  break;
-    default: break;
-    }
-
-    if (preferred != CaptureBackend::Ddagrab &&
-        backend_works(ffmpeg, preferred, monitor_index))
-        return preferred;
-
-    return CaptureBackend::Ddagrab;
+    // Native first, on every vendor. The ffmpeg-side backends were measured
+    // against OBS on the same machine and scene and all shared the same defect:
+    // frames arrive at irregular instants, so motion lurches even when almost
+    // no frame is duplicated. Only a dedicated capture thread on a strict grid
+    // fixes that, and it is vendor-neutral. The rest stay selectable because
+    // they are proven and this one is new.
+    (void)vendor; (void)ffmpeg; (void)monitor_index;
+    return CaptureBackend::Native;
 }
 
 } // namespace oc

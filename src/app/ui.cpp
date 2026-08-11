@@ -619,10 +619,73 @@ void draw_settings(AppContext& ctx) {
                            "  Measured here: 58 real fps at 60, but only 2-21 at 144.");
     }
 
+    // Exposed because it is load-bearing for the two settings around it: it
+    // decides whether capture polling can decimate, and whether clip export's
+    // -ss lands where the scrubber said. It was previously settings.json only,
+    // and a value left on vfr there silently changed what both of those did.
+    const char* fps_mode_labels[] = {"Constant (recommended)", "Variable"};
+    int fps_mode_pos = d.fps_mode == "vfr" ? 1 : 0;
     ImGui::SetNextItemWidth(px(320));
-    ImGui::SliderInt("Recording bitrate (kbps)", &d.session_bitrate_kbps, 4000, 60000);
+    if (ImGui::Combo("Frame timing", &fps_mode_pos, fps_mode_labels, 2))
+        d.fps_mode = fps_mode_pos == 1 ? "vfr" : "cfr";
+    if (fps_mode_pos == 1)
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
+                           "  Disables capture polling, and clip trim points get less exact.");
+
+    // Only the ffmpeg-side backends are asked to produce frames at a rate.
+    // Native capture waits on the duplication API and takes frames when the
+    // desktop presents them, so there is nothing here for it to control.
+    const bool native_capture =
+        d.capture_backend == "native" || d.capture_backend == "auto";
+
+    // Reduces duplicate frames but does not improve how even the motion looks;
+    // see Settings::capture_poll_multiplier for the numbers. Kept visible so the
+    // trade can be re-measured, not presented as a quality setting.
+    ImGui::SetNextItemWidth(px(320));
+    ImGui::BeginDisabled(fps_mode_pos == 1 || native_capture);
+    if (ImGui::SliderInt("Capture polling", &d.capture_poll_multiplier, 1, 4, "%dx"))
+        d.capture_poll_multiplier = std::clamp(d.capture_poll_multiplier, 1, 4);
+    ImGui::EndDisabled();
+    if (native_capture)
+        ImGui::TextDisabled("  Not used by the built-in capture, which takes frames as they arrive.");
+    else if (fps_mode_pos == 1)
+        ImGui::TextDisabled("  Ignored while frame timing is variable.");
+    else
+        ImGui::TextDisabled("  Asks the display for a frame %d times a second; still records %d fps.",
+                            d.framerate * d.capture_poll_multiplier, d.framerate);
+    if (!native_capture && fps_mode_pos == 0 && d.capture_poll_multiplier > 1)
+        ImGui::TextDisabled("  Fewer duplicate frames, but no measured gain in smoothness, and more GPU readback.");
+
+    ImGui::SetNextItemWidth(px(320));
+    ImGui::SliderInt("Recording bitrate (kbps)", &d.session_bitrate_kbps, 4000, 120000);
     ImGui::TextDisabled("  ~%.0f MB per minute",
                         d.session_bitrate_kbps * 60.0 / 8192.0);
+
+    // A bitrate only means something against the pixels it has to cover. The
+    // same 12 Mbps that looks clean at 1080p60 is a quarter of the budget at
+    // 4K60, which shows up as blocky flat areas rather than as softness. The
+    // slider gave no hint of that, so a recording left at native 4K after a
+    // resolution change quietly fell to 0.0155 bpp.
+    const int out_w = d.capture_width  > 0 ? d.capture_width
+                                           : (src_h > 0 ? (src_h * 16) / 9 : 1920);
+    const int out_h = d.capture_height > 0 ? d.capture_height
+                                           : (src_h > 0 ? src_h : 1080);
+    const double bpp = (double)d.session_bitrate_kbps * 1000.0 /
+                       ((double)out_w * out_h * std::max(d.framerate, 1));
+    const int want_kbps =
+        (int)((double)out_w * out_h * std::max(d.framerate, 1) * 0.045 / 1000.0);
+    ImGui::TextDisabled("  %dx%d at %d fps = %.4f bits per pixel", out_w, out_h,
+                        d.framerate, bpp);
+    if (bpp < 0.030) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                           "  Too low for this resolution; flat areas will go blocky.");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Set to ~0.045 bpp"))
+            d.session_bitrate_kbps = std::clamp(want_kbps, 4000, 120000);
+    } else if (bpp < 0.040) {
+        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
+                           "  On the low side; %d kbps would be comfortable.", want_kbps);
+    }
 
     // Encoder
     int enc_pos = 0;
@@ -645,15 +708,18 @@ void draw_settings(AppContext& ctx) {
     }
 
     // Capture backend
-    const char* backend_labels[] = {"Auto (recommended)", "AMD zero-copy (vsrc_amf)",
+    const char* backend_labels[] = {"Auto (recommended)", "Built-in capture (native)",
+                                    "AMD zero-copy (vsrc_amf)",
                                     "NVIDIA zero-copy (scale_cuda)",
                                     "Intel zero-copy (scale_qsv)",
                                     "Desktop Duplication (ddagrab)"};
-    const char* backend_ids[]    = {"auto", "amf", "cuda", "qsv", "ddagrab"};
+    const char* backend_ids[]    = {"auto", "native", "amf", "cuda", "qsv", "ddagrab"};
+    constexpr int kBackendCount  = 6;
     int backend_pos = 0;
-    for (int i = 0; i < 5; ++i) if (d.capture_backend == backend_ids[i]) backend_pos = i;
+    for (int i = 0; i < kBackendCount; ++i)
+        if (d.capture_backend == backend_ids[i]) backend_pos = i;
     ImGui::SetNextItemWidth(px(320));
-    if (ImGui::Combo("Capture method", &backend_pos, backend_labels, 5))
+    if (ImGui::Combo("Capture method", &backend_pos, backend_labels, kBackendCount))
         d.capture_backend = backend_ids[backend_pos];
     ImGui::SameLine();
     if (ImGui::Button("Test##backend")) {
@@ -669,8 +735,9 @@ void draw_settings(AppContext& ctx) {
                     : to_string(b) + " FAILED here; Auto would fall back to ddagrab.";
         }
     }
-    ImGui::TextDisabled("  Auto keeps frames on the GPU when your vendor's path works,");
-    ImGui::TextDisabled("  and falls back to Desktop Duplication, which runs anywhere.");
+    ImGui::TextDisabled("  Auto uses the built-in capture, which grabs frames on its own");
+    ImGui::TextDisabled("  thread and sends them on a fixed clock. The others capture");
+    ImGui::TextDisabled("  inside ffmpeg and are kept for comparison.");
 
     ImGui::Checkbox("Capture audio", &d.capture_audio);
     ImGui::SameLine();
@@ -803,7 +870,8 @@ void draw_settings(AppContext& ctx) {
     bool allow_half = d.clip_min_fps < d.clip_max_fps;
     if (ImGui::Checkbox("Allow half frame rate on long clips", &allow_half))
         d.clip_min_fps = allow_half ? std::max(1, d.clip_max_fps / 2) : d.clip_max_fps;
-    ImGui::TextDisabled("  Keeps a sharper picture when a long clip cannot hold 60 fps.");
+    ImGui::TextDisabled("  Keeps a sharper picture when a long clip cannot hold full rate.");
+
 
     // ---- folders ----
     ImGui::SeparatorText("Folders");

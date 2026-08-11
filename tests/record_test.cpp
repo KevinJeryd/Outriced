@@ -7,11 +7,21 @@
 #include "capture/audio_devices.h"
 #include "capture/recorder.h"
 #include "app/settings.h"
+#include "platform/log.h"
 
 int main(int argc, char** argv) {
+    // Unbuffered: this harness is mostly used to find out *where* something
+    // stalls, and block-buffered stdout into a pipe hides every line up to the
+    // hang, which is exactly the information wanted.
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
     const int seconds = (argc > 1) ? atoi(argv[1]) : 8;
 
     const auto root = oc::app_root();
+    // The recorder and capture both log rather than print, so without this the
+    // harness hides exactly the detail it is being run to find.
+    oc::log_init(root);
+    printf("start\n");
     auto settings = oc::Settings::load(root / "settings.json");
     settings.resolve_hardware(root);
     printf("root      : %s\n", root.string().c_str());

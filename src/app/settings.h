@@ -27,6 +27,34 @@ struct Settings {
     bool capture_audio   = true;
     bool draw_mouse      = true;
 
+    // "cfr" forces every frame onto an evenly spaced grid at `framerate`.
+    // Timestamps become predictable, which is what makes clip export's -ss/-t
+    // land exactly where the scrubber said. The cost is that when capture
+    // delivers frames at uneven real-world intervals, CFR fills the grid with
+    // near-duplicates, and motion then advances in lurches: measurably 60 fps,
+    // visibly juddery.
+    //
+    // "vfr" keeps each frame's real arrival time. Motion is honest, at the cost
+    // of less predictable seeking and worse handling in some editors.
+    std::string fps_mode = "cfr";
+
+    // How many times per second capture asks the display for a new frame, as a
+    // multiple of `framerate`. Raising it does reduce duplicate frames: measured
+    // against a 60 fps source, 1x caught 54.0 real frames/sec and 2x caught 59.8,
+    // and in a full 60 fps recording duplicates fell from 30.2% to 25.7%.
+    //
+    // It does not make motion smoother, which is the thing that actually shows.
+    // Measuring the spread of per-frame motion in the finished file, 1x scored
+    // 0.245, 2x 0.257 and 4x 0.278: flat to slightly worse. Duplicate count and
+    // perceived smoothness are close to independent, and an OBS recording of the
+    // same scene has 2-4x more duplicates than ours while looking better. So
+    // this defaults to 1 and exists for measurement rather than as a fix.
+    //
+    // Only applies to the ddagrab-based backends. The AMF backend uses
+    // wait_for_present, which is already tied to the compositor's flips. Under
+    // vfr nothing decimates the extra frames, so the recorder forces this to 1.
+    int capture_poll_multiplier = 1;
+
     // ---- Audio devices ----
     // Playback endpoints to record (loopback). Empty means "the default output",
     // which is the right answer for most people. More than one matters when a
