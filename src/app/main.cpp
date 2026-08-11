@@ -40,13 +40,19 @@ void surface_window() {
 } // namespace
 
 int main(int, char**) {
+    // Before the window, the tray or the log: a second copy would register no
+    // hotkey (RegisterHotKey is first-come) and then look broken.
+    if (!oc::claim_single_instance())
+        return 0;
+
     const auto root = oc::app_root();
 
     // Before anything else: a crash during start-up is exactly the kind that is
     // impossible to diagnose without a dump.
     oc::log_init(root);
     oc::install_crash_handler();
-    OC_LOG_I("[app] Outriced starting, root={}", root.string());
+    OC_LOG_I("[app] Outriced starting, root={}, elevated={}", root.string(),
+             oc::process_is_elevated());
 
     const auto settings_file = root / "settings.json";
     oc::Settings settings = oc::Settings::load(settings_file);
@@ -130,7 +136,9 @@ int main(int, char**) {
     ctx.renderer  = g_renderer;
     ctx.root      = root;
     ctx.ui_scale  = ui_scale > 0.1f ? ui_scale : 1.0f;
-    ctx.hotkey_ok = tray.hotkey_registered();
+    ctx.hotkey_ok        = tray.hotkey_registered();
+    ctx.marker_hotkey_ok = tray.marker_hotkey_registered();
+    ctx.elevated         = oc::process_is_elevated();
 
     oc::request_session_refresh(ctx);
     oc::request_clip_refresh(ctx);
@@ -185,6 +193,8 @@ int main(int, char**) {
 
     unsigned    active_hotkey_mods  = settings.hotkey_mods;
     unsigned    active_hotkey_vk    = settings.hotkey_vk;
+    unsigned    active_marker_mods  = settings.marker_hotkey_mods;
+    unsigned    active_marker_vk    = settings.marker_hotkey_vk;
     std::string active_sessions_dir = settings.sessions_dir;
     std::string active_clips_dir    = settings.clips_dir;
     bool        was_exporting       = false;
@@ -195,8 +205,29 @@ int main(int, char**) {
     constexpr Uint64 kUnfocusedRenderMs = 500;
     Uint64           last_render_ms     = 0;
 
+    // Set when Windows says the window's contents are no longer valid. The
+    // unfocused throttle below may not swallow these: skipping a redraw that the
+    // compositor asked for leaves whatever was behind the window on screen, and
+    // on some driver and DWM combinations that shows up as the window flickering
+    // between its own contents and stale ones for a few seconds after it loses
+    // focus. Not reproducible on the development machine, which is exactly why
+    // the throttle must be driven by the events rather than by a timer alone.
+    bool needs_render = true;
+
     auto handle_event = [&](const SDL_Event& ev) {
         ImGui_ImplSDL3_ProcessEvent(&ev);
+        switch (ev.type) {
+        case SDL_EVENT_WINDOW_EXPOSED:
+        case SDL_EVENT_WINDOW_SHOWN:
+        case SDL_EVENT_WINDOW_RESTORED:
+        case SDL_EVENT_WINDOW_RESIZED:
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+            needs_render = true;
+            break;
+        default:
+            break;
+        }
         if (ev.type == SDL_EVENT_QUIT) {
             // Closing the window keeps the recorder alive in the tray.
             SDL_HideWindow(g_window);
@@ -311,11 +342,12 @@ int main(int, char**) {
         //
         // Focused, this is skipped entirely and vsync sets the pace, exactly as
         // before.
-        if (!focused) {
+        if (!focused && !needs_render) {
             const Uint64 now_ms = SDL_GetTicks();
             if (now_ms - last_render_ms < kUnfocusedRenderMs) continue;
             last_render_ms = now_ms;
         }
+        needs_render = false;
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -347,17 +379,24 @@ int main(int, char**) {
             if (!settings.overlay_enabled) overlay.hide();
             else if (recorder.recording() && !overlay.visible())
                 overlay.show(overlay_monitor_for(settings));
-            // Re-register the hotkey in place if it changed, so the new binding
-            // works without a restart.
-            if (settings.hotkey_mods != active_hotkey_mods ||
-                settings.hotkey_vk   != active_hotkey_vk) {
+            // Re-register the hotkeys in place if either changed, so a new
+            // binding works without a restart. The marker hotkey has to be
+            // watched too: it is registered by the same call, so leaving it out
+            // meant rebinding it did nothing at all until the next restart.
+            if (settings.hotkey_mods        != active_hotkey_mods ||
+                settings.hotkey_vk          != active_hotkey_vk   ||
+                settings.marker_hotkey_mods != active_marker_mods ||
+                settings.marker_hotkey_vk   != active_marker_vk) {
                 tray.stop();
                 tray.start(settings.hotkey_mods, settings.hotkey_vk,
-               settings.marker_hotkey_mods, settings.marker_hotkey_vk);
+                           settings.marker_hotkey_mods, settings.marker_hotkey_vk);
                 tray.set_recording(recorder.recording());
                 active_hotkey_mods = settings.hotkey_mods;
                 active_hotkey_vk   = settings.hotkey_vk;
-                ctx.hotkey_ok      = tray.hotkey_registered();
+                active_marker_mods = settings.marker_hotkey_mods;
+                active_marker_vk   = settings.marker_hotkey_vk;
+                ctx.hotkey_ok        = tray.hotkey_registered();
+                ctx.marker_hotkey_ok = tray.marker_hotkey_registered();
             }
         }
 

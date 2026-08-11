@@ -55,4 +55,18 @@ private:
 // "Alt+Shift+F8" for display, from Win32 modifier and virtual-key codes.
 std::string describe_hotkey(unsigned mods, unsigned vk);
 
+// True when another Outriced already holds the single-instance lock, in which
+// case it has also been asked to show its window. Two copies would fight over
+// the global hotkey: RegisterHotKey is first-come, so the second copy silently
+// loses it and its buttons still work, which is confusing to diagnose.
+//
+// The lock is held for the lifetime of the process and released by Windows on
+// exit, including a crash, so a stale lock cannot lock the user out.
+bool claim_single_instance();
+
+// True when this process is running elevated. Windows will not deliver a hotkey
+// registered by a normal process while an elevated window has focus, which is
+// why hotkeys stop working inside games that require administrator rights.
+bool process_is_elevated();
+
 } // namespace oc

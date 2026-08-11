@@ -91,6 +91,10 @@ private:
     unsigned long long            output_bytes_     = 0;
     std::vector<double>           markers_;
 
+    // Writes markers_ to the current segment's sidecar and empties it. Called
+    // when a segment ends, whether that is a clean stop or an interruption.
+    void flush_markers();
+
     // State needed to relaunch the capture after an unexpected exit.
     bool                               stopping_ = false;
     bool                               active_   = false;

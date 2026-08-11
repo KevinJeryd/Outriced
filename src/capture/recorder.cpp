@@ -60,6 +60,11 @@ bool Recorder::start(const Settings& s, const std::filesystem::path& root) {
     QueryPerformanceCounter(&c);
     segment_start_ = c.QuadPart * 1000 / f.QuadPart;
 
+    // Cleared per session, not per segment. This used to live in launch(),
+    // which also runs on every resume, so any interruption silently discarded
+    // every highlight marked up to that point.
+    markers_.clear();
+
     const auto first = sessions_probe / (timestamp_name() + L".mp4");
     active_ = launch(first);
     return active_;
@@ -196,7 +201,6 @@ bool Recorder::launch(const std::filesystem::path& file) {
     progress_file_    = sessions / (current_file_.stem().wstring() + L".progress");
     progress_offset_  = 0;
     last_progress_ms_ = 0;
-    markers_.clear();
     arg(L"-progress"); arg(progress_file_.wstring());
     arg(L"-stats_period"); arg(L"0.5");
 
@@ -409,6 +413,20 @@ bool Recorder::launch(const std::filesystem::path& file) {
     return true;
 }
 
+void Recorder::flush_markers() {
+    // Marker times come from elapsed(), which restarts with each segment, so
+    // they belong to the segment that was recording when they were made. A
+    // resumed session therefore writes one sidecar per part rather than
+    // collecting everything into the last file with the wrong timestamps.
+    if (markers_.empty()) return;
+    const nlohmann::json j{{"markers", markers_}};
+    auto side = std::filesystem::path(current_file_).replace_extension(".json");
+    if (std::ofstream out(side); out) out << j.dump(2);
+    OC_LOG_I("[rec] wrote {} highlight marker(s) for {}", markers_.size(),
+             current_file_.filename().string());
+    markers_.clear();
+}
+
 void Recorder::mark_highlight() {
     if (!recording()) return;
     const double at = elapsed();
@@ -440,6 +458,7 @@ void Recorder::refresh_progress() {
         for (auto& a : audio_) if (a) a->stop();
         audio_.clear();
         video_.reset();
+        flush_markers();   // this segment is finished; its markers belong to it
 
         // A segment that died almost immediately means the display is still
         // changing, so wait longer before the next attempt. One that ran for a
@@ -619,12 +638,7 @@ std::optional<std::filesystem::path> Recorder::stop() {
 
     // Seed the sidecar with the markers. The scanner fills in duration and
     // geometry on the next scan and preserves whatever is written here.
-    if (!markers_.empty()) {
-        nlohmann::json j{{"markers", markers_}};
-        auto side = std::filesystem::path(current_file_).replace_extension(".json");
-        if (std::ofstream out(side); out) out << j.dump(2);
-    }
-    markers_.clear();
+    flush_markers();
 
     return current_file_;
 }

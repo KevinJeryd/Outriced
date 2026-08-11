@@ -1023,6 +1023,24 @@ void draw_settings(AppContext& ctx) {
     ImGui::TextDisabled("  Drops a marker on the timeline while recording, so the moment");
     ImGui::TextDisabled("  is easy to find afterwards. Also on the tray menu.");
 
+    if (!ctx.hotkey_ok || !ctx.marker_hotkey_ok)
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                           "  %s could not be registered; another app already owns it.",
+                           !ctx.hotkey_ok && !ctx.marker_hotkey_ok ? "Both hotkeys"
+                           : !ctx.hotkey_ok                        ? "The record hotkey"
+                                                                   : "The highlight hotkey");
+
+    // Windows refuses to deliver a hotkey to a normal process while a window
+    // belonging to an elevated one has focus. Games with kernel anti-cheat
+    // (League of Legends and Valorant both run their client elevated) therefore
+    // swallow every hotkey, while the buttons in this window keep working, which
+    // makes it look like the hotkeys are broken rather than blocked.
+    if (!ctx.elevated) {
+        ImGui::TextDisabled("  If a hotkey does nothing inside a game but works elsewhere, that");
+        ImGui::TextDisabled("  game is running as administrator. Windows will not pass hotkeys");
+        ImGui::TextDisabled("  to Outriced unless it runs as administrator too.");
+    }
+
     if (g_ui.capturing_marker) {
         ImGuiIO& io = ImGui::GetIO();
         for (int key = ImGuiKey_NamedKey_BEGIN; key < ImGuiKey_NamedKey_END; ++key) {
@@ -1145,7 +1163,10 @@ void draw_ui(AppContext& ctx) {
     }
     if (!ctx.hotkey_ok)
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
-                           "Hotkey is taken by another app - use the tray icon or rebind it.");
+                           "Record hotkey is taken by another app - use the button or rebind it.");
+    if (!ctx.marker_hotkey_ok)
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                           "Highlight hotkey is taken by another app - rebind it in Settings.");
     if (!g_ui.status.empty())
         ImGui::TextWrapped("%s", g_ui.status.c_str());
 

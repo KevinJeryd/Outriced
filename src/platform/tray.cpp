@@ -4,12 +4,22 @@
 #include <shellapi.h>
 #include <utility>
 
+#include "platform/log.h"
+
 namespace oc {
 namespace {
 
 constexpr UINT WM_OC_TRAY   = WM_APP + 1;
 constexpr UINT WM_OC_QUIT   = WM_APP + 2;
 constexpr UINT WM_OC_UPDATE = WM_APP + 3;
+
+// Broadcast by a second copy of Outriced so the first one surfaces instead.
+// A registered message rather than WM_APP+n, because this one crosses process
+// boundaries and WM_APP values are only meaningful within a single window class.
+UINT oc_show_message() {
+    static const UINT m = RegisterWindowMessageW(L"OutricedShowWindow");
+    return m;
+}
 constexpr int  kHotkeyId    = 1;
 constexpr int  kMarkerId    = 2;
 constexpr UINT kIconId      = 1;
@@ -24,6 +34,11 @@ NOTIFYICONDATAW g_nid{};
 LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     auto* self = reinterpret_cast<Tray*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     if (!self) return DefWindowProcW(hwnd, msg, wp, lp);
+
+    if (msg == oc_show_message()) {
+        self->push(TrayEvent::ShowWindow);
+        return 0;
+    }
 
     switch (msg) {
     case WM_HOTKEY:
@@ -162,11 +177,24 @@ void Tray::run(unsigned mods, unsigned vk, unsigned marker_mods, unsigned marker
     wcscpy_s(g_nid.szTip, L"Outriced - idle");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
-    hotkey_ok_.store(RegisterHotKey(hwnd, kHotkeyId, mods | MOD_NOREPEAT, vk) != FALSE,
-                     std::memory_order_relaxed);
-    marker_ok_.store(
-        RegisterHotKey(hwnd, kMarkerId, marker_mods | MOD_NOREPEAT, marker_vk) != FALSE,
-        std::memory_order_relaxed);
+    const bool toggle_ok =
+        RegisterHotKey(hwnd, kHotkeyId, mods | MOD_NOREPEAT, vk) != FALSE;
+    const bool marker_ok =
+        RegisterHotKey(hwnd, kMarkerId, marker_mods | MOD_NOREPEAT, marker_vk) != FALSE;
+    hotkey_ok_.store(toggle_ok, std::memory_order_relaxed);
+    marker_ok_.store(marker_ok, std::memory_order_relaxed);
+
+    // Logged either way. A hotkey that another application already owns fails
+    // here and then does nothing for the rest of the session, with no other
+    // symptom, which is indistinguishable from the feature being broken.
+    if (toggle_ok) OC_LOG_I("[tray] record hotkey {} registered", describe_hotkey(mods, vk));
+    else           OC_LOG_W("[tray] record hotkey {} REJECTED; another app owns it",
+                            describe_hotkey(mods, vk));
+    if (marker_ok) OC_LOG_I("[tray] marker hotkey {} registered",
+                            describe_hotkey(marker_mods, marker_vk));
+    else           OC_LOG_W("[tray] marker hotkey {} REJECTED; another app owns it",
+                            describe_hotkey(marker_mods, marker_vk));
+
     hwnd_.store(hwnd, std::memory_order_relaxed);
 
     MSG msg;
@@ -180,6 +208,30 @@ void Tray::run(unsigned mods, unsigned vk, unsigned marker_mods, unsigned marker
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     hwnd_.store(nullptr, std::memory_order_relaxed);
     DestroyWindow(hwnd);
+}
+
+bool claim_single_instance() {
+    // Deliberately leaked: the lock has to outlive every scope and Windows
+    // releases it when the process ends, however it ends.
+    static HANDLE lock = CreateMutexW(nullptr, TRUE, L"Local\\OutricedSingleInstance");
+    const bool taken = lock && GetLastError() == ERROR_ALREADY_EXISTS;
+    if (taken) {
+        // Ask whoever holds it to come to the front, so launching again behaves
+        // like clicking the tray icon rather than doing nothing at all.
+        PostMessageW(HWND_BROADCAST, oc_show_message(), 0, 0);
+    }
+    return !taken;
+}
+
+bool process_is_elevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                        sizeof(elevation), &size) != FALSE;
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated != 0;
 }
 
 } // namespace oc

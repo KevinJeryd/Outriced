@@ -27,6 +27,10 @@ struct AppContext {
     float ui_scale  = 1.0f;
 
     bool  hotkey_ok = true;
+    bool  marker_hotkey_ok = true;
+    // Windows does not deliver a hotkey registered by a normal process while an
+    // elevated window has focus, so this decides whether to explain that.
+    bool  elevated = false;
     bool  quit      = false;
     bool  toggle_recording_requested = false;  // set by the UI, consumed by main
     bool  settings_dirty = false;              // settings changed; main persists
