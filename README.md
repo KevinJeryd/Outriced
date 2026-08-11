@@ -24,7 +24,7 @@ Includes are folder-qualified (`#include "capture/recorder.h"`). `src/` is the
 only include root.
 
 `ARCHITECTURE.md` covers how the pieces fit together: the subprocess model, the
-four channels used to talk to ffmpeg, the capture pipelines, the threading model
+five channels used to talk to ffmpeg, the capture pipelines, the threading model
 and the invariants worth knowing before changing anything.
 
 ## Build
@@ -113,9 +113,11 @@ on disk. Anything left blank is resolved by probing the machine on first run.
 | `capture_width` / `capture_height` | `1920` / `1080` | Both `0` records at native resolution |
 | `framerate` | `60` | Capped to the monitor's refresh rate |
 | `encoder` | auto | `h264_amf` / `h264_nvenc` / `h264_qsv` / `libx264`, detected from the GPU |
-| `capture_backend` | `auto` | `auto`, `amf`, `cuda`, `qsv` or `ddagrab` |
-| `session_bitrate_kbps` | `12000` | |
-| `capture_audio` / `draw_mouse` | `true` | |
+| `capture_backend` | `auto` | `auto`, `native`, `amf`, `cuda`, `qsv` or `ddagrab`; `auto` picks `native` |
+| `session_bitrate_kbps` | `12000` | Sized for 1080p60. At 4K it needs roughly four times as much |
+| `fps_mode` | `cfr` | `cfr` or `vfr`; `vfr` makes clip trim points less exact |
+| `capture_poll_multiplier` | `1` | ffmpeg-side backends only; unused by `native` |
+| `capture_audio` / `draw_mouse` | `true` | `draw_mouse` applies to the ffmpeg-side backends |
 | `audio_outputs` | `[]` | Endpoint ids to record via loopback; empty uses the system default |
 | `audio_input` | `""` | Microphone endpoint id; empty records none |
 | `audio_track_mode` | `mixed` | `mixed` or `separate` |
@@ -313,16 +315,20 @@ ffmpeg's own words, from the log:
 [fc#0] Error requesting a frame from the filtergraph
 ```
 
-Both capture backends are built on **DXGI Desktop Duplication**, and Windows
+Every capture backend is built on **DXGI Desktop Duplication**, and Windows
 invalidates a duplication handle whenever the desktop it was acquired against
 changes underneath it: a resolution or refresh change, a desktop switch (UAC,
 Ctrl-Alt-Del, the lock screen), or an application taking or releasing exclusive
 fullscreen. Pressing the Windows key drops the game out of fullscreen, which is
 that last case.
 
-Neither `vsrc_amf` nor `ddagrab` re-acquires the duplication after it is lost, so
-the surface stops being valid, the filtergraph errors and ffmpeg exits.
-Restarting the capture is the only fix available from outside ffmpeg.
+The built-in capture re-acquires the duplication and carries on, so the recording
+stays in one file. It logs how many times that happened as `resets` when you stop.
+
+The ffmpeg-side backends cannot do this. Neither `vsrc_amf` nor `ddagrab`
+re-acquires after the handle is lost, so the surface goes invalid, the
+filtergraph errors and ffmpeg exits. From outside ffmpeg the only option is to
+restart the capture, and the rest of this section is about those backends.
 
 Resuming is delayed on purpose. Relaunching immediately fails again, because the
 mode change is still in progress; the replacement dies within seconds and one
@@ -344,11 +350,15 @@ display and scaling to 1080p:
 | 60 | 58.4 | 50 ms |
 | 144 | 2.4 to 21 | 1.7 s |
 
-At 60 the capture is essentially perfect: 97% of frames land exactly 16.7 ms
-apart. At 144 it collapses, because the capture, the 4K downscale and the encoder
-all compete with the game for the same GPU. The file still claims 144 fps, since
-`-fps_mode cfr` pads the shortfall with duplicate frames, which is what reads as
-stutter on playback.
+At 144 the capture collapses, because the capture, the 4K downscale and the
+encoder all compete with the game for the same GPU. The file still claims 144
+fps, since `-fps_mode cfr` pads the shortfall with duplicate frames.
+
+Treat the 60 fps row with care. Counting unique frames says the capture is close
+to perfect at 60, and by that measure it is, since almost nothing is duplicated.
+It says nothing about whether the frames are evenly spaced, which is what you
+actually see, and the same footage scored badly on that. See **Capture
+backends**.
 
 The frame-rate slider is capped to the monitor's refresh rate, and anything above
 60 carries a warning. Recording above the panel's refresh cannot produce new
@@ -364,14 +374,33 @@ Two related settings come from the same investigation:
 
 ## Capture backends
 
-`ddagrab` produces BGRA D3D11 frames that every GPU-side consumer on this driver
-rejects: `h264_amf`, `scale_d3d11` and `vpp_amf` all fail, and Vulkan interop is
-not implemented in this ffmpeg build. The frames therefore round-trip through
-system memory for the colour conversion, which is expensive at 4K.
+The default is **built-in capture**. Outriced runs Desktop Duplication on its own
+thread, scales and converts each frame on the GPU, and hands ffmpeg finished NV12
+frames over a pipe. ffmpeg does not capture anything in this mode.
 
-AMD ships its own capture source, so on AMD the pipeline is
-`vsrc_amf` to `vpp_amf` to `h264_amf` and no frame leaves the GPU. Measured on
-the reference machine (RX 9070 XT, i5-13600K, 4K desktop scaled to 1080p60):
+How smooth a recording looks depends on when each frame is taken, not how many
+you take. A capture filter inside ffmpeg gets pulled by the filtergraph, so
+frames come at uneven intervals; the built-in capture takes them as the desktop
+presents them and sends one on a fixed timer, repeating the last frame if nothing
+new turned up. Recording the same scene in OBS gave something to compare against:
+
+| | evenness of motion | largest jumps | duplicated frames |
+|---|---|---|---|
+| built-in | 1.067 | 3.12x | 3.4% |
+| ddagrab | 1.207 | 4.88x | 1.4% |
+| OBS | 0.893 | 2.47x | 2.4% |
+
+Lower is smoother in the first two columns. Duplicated frames go up, which is the
+trade being made: a repeat at the right moment beats a new frame at the wrong one.
+
+The ffmpeg-side backends are still selectable. `ddagrab` produces BGRA D3D11 frames
+that every GPU-side consumer on this driver rejects (`h264_amf`, `scale_d3d11`
+and `vpp_amf` all fail, and Vulkan interop is not implemented in this ffmpeg
+build), so its frames round-trip through system memory for the colour conversion,
+which is expensive at 4K. AMD ships its own capture source, so on AMD the
+pipeline can be `vsrc_amf` to `vpp_amf` to `h264_amf` with no frame leaving the
+GPU. Measured on the reference machine (RX 9070 XT, i5-13600K, 4K desktop scaled
+to 1080p60):
 
 | | ddagrab + readback | vsrc_amf zero-copy |
 |---|---|---|

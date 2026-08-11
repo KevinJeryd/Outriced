@@ -8,7 +8,7 @@ so the whole thing is readable in an afternoon.
 
 1. [Mental model](#1-mental-model)
 2. [Process architecture](#2-process-architecture)
-3. [The four IPC channels](#3-the-four-ipc-channels)
+3. [The five IPC channels](#3-the-five-ipc-channels)
 4. [Module map](#4-module-map)
 5. [Video capture](#5-video-capture)
 6. [Audio capture](#6-audio-capture)
@@ -22,19 +22,25 @@ so the whole thing is readable in an afternoon.
 
 ## 1. Mental model
 
-Outriced is a GUI that **builds ffmpeg command lines, launches ffmpeg as a
-separate process, and communicates with it while it runs.**
+Outriced is a GUI that **captures the screen and the audio itself, and uses
+ffmpeg as a subprocess to compress and mux what it captured.**
 
-Almost no media data passes through this codebase. The single exception is audio
-capture, which exists only because the bundled ffmpeg has no WASAPI support.
+It did not start that way. ffmpeg used to capture the screen as well, and audio
+was the only media data this code touched, because the bundled ffmpeg has no
+WASAPI support. Video moved in here because how smooth a recording looks depends
+on when each frame is taken, and there was no way to control that from outside
+ffmpeg. Section 5 has the numbers. The old filter-based backends still work and
+are still selectable.
 
-Consequences of that design:
+What follows from that:
 
-- Encoding behaviour is changed by editing strings, not algorithms.
-- The recorder cannot call into ffmpeg or inspect its state. Everything is done
-  through the four channels in section 3.
-- Any recording problem can be reproduced outside the app by copying the command
-  line from the log into a terminal.
+- Encoding behaviour changes by editing strings, not algorithms. Capture
+  behaviour is now ordinary code here, with ordinary bugs.
+- The recorder cannot call into ffmpeg or read its state. Everything goes through
+  the five channels in section 3.
+- Copying the command line out of the log into a terminal usually reproduces a
+  recording problem. Not on the native backend, where the video input is a pipe
+  that only this process fills.
 
 ---
 
@@ -76,30 +82,41 @@ The same class is reused for `ffprobe`, thumbnail extraction and clip export.
 
 | Process | Lifetime | Purpose |
 |---|---|---|
-| `outriced.exe` | the session | UI, capture control, audio capture |
-| `ffmpeg.exe` (recording) | one per segment | screen capture, encode, mux |
+| `outriced.exe` | the session | UI, screen capture, audio capture |
+| `ffmpeg.exe` (recording) | one per segment | encode and mux; capture only on the ffmpeg-side backends |
 | `ffmpeg.exe` (clip) | seconds to minutes | two-pass clip export |
 | `ffmpeg.exe` (thumbnail) | under a second | single frame extraction |
 | `ffprobe.exe` | under a second | duration and stream geometry |
 
 ---
 
-## 3. The four IPC channels
+## 3. The five IPC channels
 
-While recording, `outriced.exe` and `ffmpeg.exe` are connected by exactly four
-things.
+While recording, `outriced.exe` and `ffmpeg.exe` are connected by exactly five
+things. The video pipe exists only on the native backend; on the ffmpeg-side
+backends there are four, and ffmpeg reads the screen itself.
 
 ```
                      ┌────────────────────────────┐
    "q"  ──stdin────▶ │                            │
                      │         ffmpeg.exe         │
-   PCM ──named pipes▶│                            │
-                     │  reads the screen itself   │
-   fps ◀──file─────  │  via ddagrab / vsrc_amf    │
+  NV12 ──named pipe▶ │                            │
+                     │  encodes and muxes;        │
+   PCM ──named pipes▶│  captures nothing on the   │
+                     │  native backend            │
+   fps ◀──file─────  │                            │
                      │                            │
  errors ◀─stderr───  │                            │
                      └────────────────────────────┘
 ```
+
+Recordings end differently on the two models. A capture filter never runs out of
+input, so those backends have to be told to stop with `q`. A pipe does run out:
+closing it is the stop signal and ffmpeg writes the moov atom by itself. Sending
+`q` while still pushing frames into the pipe does not work, and the first version
+did exactly that: ffmpeg sat there for the full 15 s timeout, got killed, and
+truncated the file. `Recorder::stop()` now closes the capture first whenever
+`video_` is set, and only falls back to `q` after that.
 
 ### 3.1 stdin: graceful stop
 
@@ -225,16 +242,17 @@ src/
 
 | File | Lines | Responsibility |
 |---|---|---|
-| `app/ui.cpp` | 1057 | All ImGui rendering and interaction |
-| `capture/recorder.cpp` | 451 | Command-line assembly, process lifecycle, resume |
-| `app/main.cpp` | 310 | Event loop, wiring, policy decisions |
-| `capture/audio_capture.cpp` | 246 | WASAPI capture into a named pipe |
-| `media/clipper.cpp` | 240 | Budget calculation and two-pass export |
-| `media/sessions.cpp` | 222 | Library scanning, sidecars, pruning |
-| `capture/encoders.cpp` | 198 | Vendor detection, backend probing, graph building |
-| `platform/overlay.cpp` | 197 | Always-on-top status window |
-| `platform/subprocess.cpp` | 180 | Process creation and the stdin/stderr pipes |
-| `media/player.cpp` | 175 | libmpv embedding |
+| `app/ui.cpp` | 1259 | All ImGui rendering and interaction |
+| `capture/recorder.cpp` | 632 | Command-line assembly, process lifecycle, resume |
+| `capture/video_capture.cpp` | 570 | Desktop Duplication, GPU scale/convert, timing grid |
+| `app/main.cpp` | 396 | Event loop, wiring, policy decisions |
+| `capture/audio_capture.cpp` | 287 | WASAPI capture into a named pipe |
+| `media/clipper.cpp` | 280 | Budget calculation and two-pass export |
+| `media/sessions.cpp` | 261 | Library scanning, sidecars, pruning |
+| `capture/encoders.cpp` | 247 | Vendor detection, backend probing, graph building |
+| `platform/overlay.cpp` | 236 | Always-on-top status window |
+| `platform/subprocess.cpp` | 210 | Process creation and the stdin/stderr pipes |
+| `media/player.cpp` | 206 | libmpv embedding |
 
 Includes are folder-qualified (`#include "capture/recorder.h"`); `src/` is the
 only include root.
@@ -254,19 +272,79 @@ only include root.
   `vsrc_amf` captures, `vpp_amf` scales and converts, `h264_amf` encodes.
 - **DXGI** describes graphics hardware: adapters, outputs and their modes.
 
+### Why capture moved out of ffmpeg
+
+Recordings looked juddery, but counting duplicate frames said they were fine, and
+that was true: hardly any frame was a duplicate. The frames were just unevenly
+spaced in time. The file is written as constant 60 fps, so a player shows every
+frame for 16.7 ms, but the content was sampled at irregular moments. Two frames
+holding 40 ms of camera movement get played in 16.7 ms and the camera appears to
+jump.
+
+Recording the same scene in OBS gave something to compare against. Both numbers
+below come from the per-frame `scene_score`: how much its spread varies, and how
+big the 90th-percentile step is next to the median.
+
+| | motion CV | 90th/median step | duplicated |
+|---|---|---|---|
+| ddagrab | 1.207 | 4.88x | 1.4% |
+| native | 1.067 | 3.12x | 3.4% |
+| OBS | 0.893 | 2.47x | 2.4% |
+
+OBS duplicates more frames than ddagrab did and still looks better, so duplicate
+count is close to useless as a quality measure. Optimising it is what hid the
+real problem for so long.
+
+`ddagrab` fetches a frame when the filtergraph asks for one, and the graph is
+busy reading 33 MB back off the GPU, scaling it and encoding it. So the interval
+between captures follows whatever the rest of the pipeline is doing. Measured at
+60 fps: mean gap 18.4 ms, standard deviation 8.25 ms, worst 40.5 ms.
+
+Everything reachable from the command line was tried first and none of it helped:
+
+- Readback. Staged at 4K: capture alone 59.3 fps, plus readback 55.7, plus scale
+  54.2, plus encode 54.2.
+- The encoder, which turned out to cost nothing.
+- Output resolution. 720p scored 1.173 against 1080p's 1.137.
+- Poll rate. 0.245 / 0.257 / 0.278 at 1x / 2x / 4x.
+- `fps_mode`, and matching the recording rate to a divisor of the 144 Hz panel.
+
 ### Backends
 
-A backend is the set of filters used to obtain frames. Both use Desktop
-Duplication underneath; `vsrc_amf` exposes it through the option
-`duplicate_output`. AMF does **not** bypass Windows.
+A backend is how frames are obtained. All of them sit on Desktop Duplication;
+`vsrc_amf` exposes it through the option `duplicate_output`. AMF does **not**
+bypass Windows.
 
-| | ddagrab | AMF |
-|---|---|---|
-| Acquisition | Desktop Duplication | Desktop Duplication |
-| Frame format | generic D3D11 texture | AMF surface |
-| Conversion | `hwdownload` to system RAM, CPU convert | `vpp_amf`, stays on the GPU |
-| Vendor | any | AMD only |
-| ffmpeg CPU over 12 s | 15.5 s (~129% of a core) | 3.0 s (~25% of a core) |
+`native` is the default on every vendor. `VideoCapture` splits capture from
+timing across two threads:
+
+- A capture thread blocks in `AcquireNextFrame`, which Windows wakes when the
+  desktop presents. Each new image overwrites a single `latest` slot.
+- A timer sends a frame every `1/framerate` seconds, whatever is in `latest` at
+  that moment, scaled and converted by the D3D11 video processor. If nothing new
+  arrived, the previous frame goes again.
+
+The display runs at 144 Hz and the file is 60 fps, so something has to pick which
+60 of those moments to keep. A steady timer picks them evenly; ffmpeg picked them
+whenever its graph came round.
+
+Doing the scale ourselves also worked around something that could not be done
+inside ffmpeg at all. `scale_d3d11` rejected ddagrab's RGB frames, `vpp_amf`
+failed with `QueryOutput() error 18`, and `-init_hw_device vulkan=vk@dx` returned
+`Function not implemented`, which left the CPU as the only place to scale. One
+`VideoProcessorBlt` now does the scale and the BGRA-to-NV12 conversion together,
+so the readback drops from 33.2 MB per frame to 3.1 MB. Useful, but not why the
+footage improved; the readback only ever cost about 3.6 fps.
+
+| | native | ddagrab | AMF |
+|---|---|---|---|
+| Runs in | `outriced.exe` | ffmpeg | ffmpeg |
+| Acquisition | blocking `AcquireNextFrame` | Desktop Duplication | Desktop Duplication |
+| Emission | fixed timer, repeats when late | pulled by the graph | pulled by the graph |
+| Conversion | `VideoProcessorBlt` on the GPU | `hwdownload`, CPU convert | `vpp_amf`, stays on the GPU |
+| Readback per frame at 1080p | 3.1 MB | 33.2 MB | none |
+| Vendor | any | any | AMD only |
+| ffmpeg CPU over 12 s | not measured | 15.5 s (~129% of a core) | 3.0 s (~25% of a core) |
 
 The difference is not the acquisition route. It is that AMD's capture, scaler and
 encoder share a surface format, so frames never round-trip through system memory.
@@ -307,31 +385,38 @@ if (desc.DedicatedVideoMemory >= best_vram) {
 
 ### Backend selection
 
-`auto` prefers the vendor's on-GPU path but **verifies it by running it**:
+`auto` returns `Native` on every vendor. Uneven capture timing is not a
+vendor-specific problem and the vendor paths do not help with it.
+
+There is no probe. `VideoCapture::start()` returns false if the monitor cannot be
+duplicated, which happens when another capture tool holds it or the GPU has no
+video processor, and the recorder drops to `ddagrab`:
 
 ```cpp
-CaptureBackend preferred = CaptureBackend::Ddagrab;
-switch (vendor) {
-case Vendor::Amd:    preferred = CaptureBackend::Amf;  break;
-case Vendor::Nvidia: preferred = CaptureBackend::Cuda; break;
-case Vendor::Intel:  preferred = CaptureBackend::Qsv;  break;
-default: break;
-}
-
-if (preferred != CaptureBackend::Ddagrab &&
-    backend_works(ffmpeg, preferred, monitor_index))
-    return preferred;
-
-return CaptureBackend::Ddagrab;
+if (vcap->start(video_pipe, vc)) video_ = std::move(vcap);
+else                             backend = CaptureBackend::Ddagrab;
 ```
 
-`backend_works()` runs the real filter chain for four frames. Feature detection
-by name is insufficient: `scale_d3d11` and `vpp_amf` are both present on the
-reference machine and both fail against ddagrab's frames.
+That only catches failures during startup. One bug during development got past
+`start()` and then captured nothing at all, because the source texture was
+missing `D3D11_BIND_RENDER_TARGET` and the video processor refused it. `start()`
+had already returned by then, so there was nothing left to fall back to. On
+hardware nobody has tried, a black or empty recording is the thing to look for,
+and the `[cap]` lines in the log say which call failed.
 
-The CUDA and QSV paths are written to ffmpeg's documented pattern but **have
-never been tested on hardware**. The runtime probe means an unsupported machine
-falls back to `ddagrab` rather than failing to record.
+The ffmpeg-side backends still go through `backend_works()`, which runs the real
+filter chain for four frames. Checking whether a filter exists by name is not
+enough: `scale_d3d11` and `vpp_amf` are both present on the reference machine and
+both fail on ddagrab's frames. The CUDA and QSV paths follow ffmpeg's documented
+pattern but **have never been tested on hardware**.
+
+### Frames are never dropped
+
+`rawvideo` has no timestamps, so a frame's position in the stream is its time.
+Dropping one does not leave a gap, it makes the file shorter, and the picture
+jumps forward. When the queue fills up, capture waits for room (`kQueueWaitMs`)
+rather than throwing anything away. An early version dropped instead and lost 12
+frames in 6 seconds.
 
 ---
 
