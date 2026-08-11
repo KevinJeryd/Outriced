@@ -30,6 +30,101 @@ namespace oc {
 float   g_scale = 1.0f;
 UiState g_ui;
 
+namespace {
+
+// ::tolower takes and returns int and is undefined for negative char values,
+// so every character goes through unsigned char first.
+char fold_char(char c) { return (char)std::tolower((unsigned char)c); }
+
+std::string_view trimmed(std::string_view s) {
+    while (!s.empty() && std::isspace((unsigned char)s.front())) s.remove_prefix(1);
+    while (!s.empty() && std::isspace((unsigned char)s.back()))  s.remove_suffix(1);
+    return s;
+}
+
+} // namespace
+
+bool tags_equal(std::string_view a, std::string_view b) {
+    a = trimmed(a);
+    b = trimmed(b);
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (fold_char(a[i]) != fold_char(b[i])) return false;
+    return true;
+}
+
+bool tag_contains(std::string_view haystack, std::string_view needle) {
+    needle = trimmed(needle);
+    if (needle.empty()) return true;
+    if (needle.size() > haystack.size()) return false;
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        size_t k = 0;
+        while (k < needle.size() && fold_char(haystack[i + k]) == fold_char(needle[k])) ++k;
+        if (k == needle.size()) return true;
+    }
+    return false;
+}
+
+bool has_tag(const Session& s, std::string_view tag) {
+    for (const auto& t : s.tags)
+        if (tags_equal(t, tag)) return true;
+    return false;
+}
+
+const std::vector<std::string>& known_tags() {
+    if (g_ui.tag_cache_valid) return g_ui.tag_cache;
+
+    std::vector<std::string> out;
+    auto absorb = [&](const std::vector<Session>& items) {
+        for (const auto& s : items)
+            for (const auto& t : s.tags) {
+                if (trimmed(t).empty()) continue;
+                bool seen = false;
+                for (const auto& o : out) if (tags_equal(o, t)) { seen = true; break; }
+                if (!seen) out.push_back(t);
+            }
+    };
+    absorb(g_ui.sessions.items);
+    absorb(g_ui.clips.items);
+    std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        return std::lexicographical_compare(
+            a.begin(), a.end(), b.begin(), b.end(),
+            [](char x, char y) { return fold_char(x) < fold_char(y); });
+    });
+
+    g_ui.tag_cache       = std::move(out);
+    g_ui.tag_cache_valid = true;
+    return g_ui.tag_cache;
+}
+
+bool matches_filter(const Session& s, const std::vector<std::string>& filter) {
+    for (const auto& want : filter)
+        if (!has_tag(s, want)) return false;
+    return true;
+}
+
+bool add_tag_to(Session& s, std::string_view tag) {
+    const auto clean = trimmed(tag);
+    if (clean.empty() || has_tag(s, clean)) return true;
+    s.tags.emplace_back(clean);
+    // Only clears the flag. The vector itself is untouched until the next
+    // known_tags(), so a caller iterating it right now keeps a valid reference.
+    g_ui.tag_cache_valid = false;
+    if (save_tags(s)) return true;
+    OC_LOG_W("[ui] could not write tags for {}", s.file.filename().string());
+    return false;
+}
+
+bool remove_tag_from(Session& s, std::string_view tag) {
+    const auto before = s.tags.size();
+    std::erase_if(s.tags, [&](const std::string& t) { return tags_equal(t, tag); });
+    if (s.tags.size() == before) return true;
+    g_ui.tag_cache_valid = false;
+    if (save_tags(s)) return true;
+    OC_LOG_W("[ui] could not write tags for {}", s.file.filename().string());
+    return false;
+}
+
 Library& active_library() {
     return g_ui.tab == Tab::Clips ? g_ui.clips : g_ui.sessions;
 }
@@ -62,6 +157,7 @@ void absorb_scan(Library& lib) {
         previous = lib.items[lib.selected].file.string();
 
     lib.items = std::move(lib.scanned);
+    g_ui.tag_cache_valid = false;   // the tags these items carry just changed
     lib.selected = -1;
     for (int i = 0; i < (int)lib.items.size(); ++i) {
         if (lib.items[i].file.string() == previous) { lib.selected = i; break; }

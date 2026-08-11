@@ -24,6 +24,81 @@
 #include "platform/tray.h"
 
 namespace oc {
+namespace {
+
+// Tags on the open video: existing ones as removable chips, then a popup that
+// both picks an existing tag and creates a new one.
+//
+// Each edit writes the sidecar immediately rather than on leaving the screen. A
+// rescan runs on a worker thread and replaces the whole item list when it lands,
+// so anything still only in memory at that moment would be lost.
+void draw_tag_editor(Session& s) {
+    // Recomputed every frame, and this runs before the video is positioned, so
+    // the flag is right for the frame it is read in.
+    g_ui.tag_popup_open = false;
+
+    ImGui::SeparatorText("Tags");
+
+    for (int i = 0; i < (int)s.tags.size(); ++i) {
+        // Without a unique id per chip every "x" button is the same widget and
+        // they all respond to a click on any one of them.
+        ImGui::PushID(i);
+        ImGui::TextUnformatted(s.tags[i].c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) {
+            remove_tag_from(s, s.tags[i]);
+            ImGui::PopID();
+            break;              // the vector just changed; stop iterating it
+        }
+        ImGui::PopID();
+        ImGui::SameLine();
+    }
+    if (s.tags.empty()) {
+        ImGui::TextDisabled("No tags");
+        ImGui::SameLine();
+    }
+
+    if (ImGui::Button("Add tag")) {
+        g_ui.tag_input[0] = '\0';
+        ImGui::OpenPopup("add_tag");
+    }
+
+    if (ImGui::BeginPopup("add_tag")) {
+        g_ui.tag_popup_open = true;
+        ImGui::TextDisabled("Type a name and press Enter, or pick one below.");
+        ImGui::SetNextItemWidth(px(260));
+
+        // Focused on the frame the popup opens so it can be typed into straight
+        // away; doing it every frame would fight the mouse.
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        const bool entered = ImGui::InputText("##tag_name", g_ui.tag_input,
+                                              sizeof(g_ui.tag_input),
+                                              ImGuiInputTextFlags_EnterReturnsTrue);
+        if (entered && g_ui.tag_input[0]) {
+            add_tag_to(s, g_ui.tag_input);
+            g_ui.tag_input[0] = '\0';
+            ImGui::CloseCurrentPopup();
+        }
+
+        const auto& all = known_tags();
+        bool any_offered = false;
+        for (const auto& t : all) {
+            if (has_tag(s, t)) continue;               // already on this video
+            if (!tag_contains(t, g_ui.tag_input)) continue;
+            if (!any_offered) { ImGui::Separator(); any_offered = true; }
+            if (ImGui::Selectable(t.c_str())) {
+                add_tag_to(s, t);
+                g_ui.tag_input[0] = '\0';
+                ImGui::CloseCurrentPopup();
+                break;      // `t` points into the list add_tag_to just invalidated
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+
+} // namespace
+
 // ---------------------------------------------------------------- preview
 
 void draw_preview(Library& lib, AppContext& ctx) {
@@ -31,7 +106,9 @@ void draw_preview(Library& lib, AppContext& ctx) {
         lib.view = View::List;
         return;
     }
-    const Session& s = lib.items[lib.selected];
+    // Non-const because the tag section edits this session in place. Everything
+    // else here only reads it.
+    Session& s = lib.items[lib.selected];
     Player& player = *ctx.player;
 
     if (ImGui::Button("< Back", px(90, 30))) {
@@ -50,6 +127,8 @@ void draw_preview(Library& lib, AppContext& ctx) {
     if (ImGui::Button("Delete", px(90, 30))) ask_delete(s);
     ImGui::PopStyleColor();
 
+    draw_tag_editor(s);
+
     const double duration = player.duration() > 0 ? player.duration() : s.duration;
 
     // Reserve the video area; the mpv child window is positioned over it.
@@ -58,13 +137,14 @@ void draw_preview(Library& lib, AppContext& ctx) {
     ImVec2 video_pos = ImGui::GetCursorScreenPos();
     ImVec2 video_size(avail.x, std::max(120.0f, avail.y - controls_h));
 
-    if (player.available() && !g_ui.modal_active) {
+    if (player.available() && !g_ui.modal_active && !g_ui.tag_popup_open) {
         ImVec2 win_pos = ImGui::GetMainViewport()->Pos;
         player.set_visible(true);
         player.set_rect((int)(video_pos.x - win_pos.x), (int)(video_pos.y - win_pos.y),
                         (int)video_size.x, (int)video_size.y);
     } else if (player.available()) {
-        // A modal is up: get the video out of the way so the dialog is visible.
+        // A modal or the tag popup is up: mpv's child window sits above
+        // everything ImGui draws, so it has to go away for them to be visible.
         player.set_visible(false);
         ImGui::GetWindowDrawList()->AddRectFilled(
             video_pos, ImVec2(video_pos.x + video_size.x, video_pos.y + video_size.y),

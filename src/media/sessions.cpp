@@ -79,6 +79,27 @@ Probe probe_video(const std::filesystem::path& video,
 
 } // namespace
 
+bool save_tags(const Session& sess) {
+    const auto side = sidecar_for(sess.file);
+
+    // Read-modify-write rather than rebuild: the probe fields belong to the
+    // scanner and must survive a tag edit, and a video that has never been
+    // probed has no sidecar yet, which is fine -- the scan fills the rest in.
+    json j = json::object();
+    if (std::ifstream in(side); in) {
+        try { in >> j; } catch (const std::exception&) { j = json::object(); }
+        if (!j.is_object()) j = json::object();
+    }
+
+    if (sess.tags.empty()) j.erase("tags");
+    else                   j["tags"] = sess.tags;
+
+    std::ofstream out(side, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << j.dump(2);
+    return out.good();
+}
+
 std::string format_duration(double seconds) {
     if (seconds < 0) seconds = 0;
     const int total = (int)(seconds + 0.5);
@@ -134,6 +155,10 @@ std::vector<Session> scan_videos(const std::filesystem::path& dir,
                 // re-probe, so they are read whether or not the rest is stale.
                 if (auto m = j.find("markers"); m != j.end() && m->is_array())
                     sess.markers = m->get<std::vector<double>>();
+                // Tags are user data, like markers: read whether or not the
+                // probe cache below is still valid.
+                if (auto t = j.find("tags"); t != j.end() && t->is_array())
+                    sess.tags = t->get<std::vector<std::string>>();
                 if (j.value("size_bytes", 0ull) == sess.size_bytes) {
                     sess.duration = j.value("duration", 0.0);
                     sess.width    = j.value("width", 0);
@@ -152,7 +177,10 @@ std::vector<Session> scan_videos(const std::filesystem::path& dir,
             if (sess.duration > 0.0) {
                 json j{{"duration", sess.duration}, {"size_bytes", sess.size_bytes},
                        {"width", sess.width}, {"height", sess.height}, {"fps", sess.fps}};
+                // Anything not put back here is destroyed: this rebuilds the
+                // sidecar from scratch rather than editing it.
                 if (!sess.markers.empty()) j["markers"] = sess.markers;
+                if (!sess.tags.empty())    j["tags"]    = sess.tags;
                 if (std::ofstream o(side); o) o << j.dump(2);
             }
         }

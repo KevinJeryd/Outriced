@@ -24,6 +24,8 @@
 #include "platform/tray.h"
 
 namespace oc {
+namespace {
+
 SDL_Texture* thumbnail_texture(const Session& sess, AppContext& ctx) {
     const std::string key = sess.file.string();
     if (auto it = g_ui.thumbs.find(key); it != g_ui.thumbs.end())
@@ -41,6 +43,54 @@ SDL_Texture* thumbnail_texture(const Session& sess, AppContext& ctx) {
     return tex;
 }
 
+// A row of the tags currently filtered on, plus a popup to add another. Tags
+// combine with AND: each one added narrows the list further.
+void draw_tag_filter(Library& lib) {
+    const auto& all = known_tags();
+    if (all.empty() && lib.filter_tags.empty()) return;   // nothing tagged yet
+
+    ImGui::TextDisabled("Filter:");
+    ImGui::SameLine();
+
+    for (int i = 0; i < (int)lib.filter_tags.size(); ++i) {
+        ImGui::PushID(2000 + i);
+        ImGui::TextUnformatted(lib.filter_tags[i].c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("x")) {
+            lib.filter_tags.erase(lib.filter_tags.begin() + i);
+            ImGui::PopID();
+            break;
+        }
+        ImGui::PopID();
+        ImGui::SameLine();
+    }
+
+    if (ImGui::SmallButton("+ Tag")) ImGui::OpenPopup("filter_tag");
+    if (!lib.filter_tags.empty()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear")) lib.filter_tags.clear();
+    }
+
+    if (ImGui::BeginPopup("filter_tag")) {
+        bool any = false;
+        for (const auto& t : all) {
+            bool already = false;
+            for (const auto& f : lib.filter_tags)
+                if (tags_equal(f, t)) { already = true; break; }
+            if (already) continue;
+            any = true;
+            if (ImGui::Selectable(t.c_str())) {
+                lib.filter_tags.push_back(t);
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        if (!any) ImGui::TextDisabled("No other tags in use.");
+        ImGui::EndPopup();
+    }
+}
+
+} // namespace
+
 // ---------------------------------------------------------------- list view
 
 void draw_list(Library& lib, AppContext& ctx, bool clips) {
@@ -54,9 +104,17 @@ void draw_list(Library& lib, AppContext& ctx, bool clips) {
         return;
     }
 
+    draw_tag_filter(lib);
+
     ImGui::BeginChild("list", px(0, 0));
+    int shown = 0;
     for (int i = 0; i < (int)lib.items.size(); ++i) {
         const Session& s = lib.items[i];
+        // Filtered rows are skipped rather than removed from the vector:
+        // lib.selected is an index into lib.items, so a filtered copy would
+        // point the selection at the wrong video.
+        if (!matches_filter(s, lib.filter_tags)) continue;
+        ++shown;
         ImGui::PushID(i);
 
         const float row_h = px(92.0f);
@@ -113,6 +171,8 @@ void draw_list(Library& lib, AppContext& ctx, bool clips) {
         }
         ImGui::PopID();
     }
+    if (shown == 0)
+        ImGui::TextDisabled("No %s match the selected tags.", clips ? "clips" : "sessions");
     ImGui::EndChild();
 }
 

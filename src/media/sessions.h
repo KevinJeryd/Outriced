@@ -17,8 +17,17 @@ struct Session {
     int                   height     = 0;
     int                   fps        = 0;
     std::vector<double>   markers;            // highlight positions, seconds
+    std::vector<std::string> tags;            // free-form labels, user assigned
     std::filesystem::path thumbnail;          // may not exist yet
 };
+
+// Writes `sess.tags` into the video's sidecar, leaving every other key alone.
+//
+// Separate from the scan because tags are edited in the UI, while everything
+// else in a sidecar is measured by ffprobe. This reads the existing file and
+// puts it back rather than rebuilding it, so a key written by a different build
+// is not silently dropped.
+bool save_tags(const Session& sess);
 
 // Scans a folder of videos, newest first. Duration and stream geometry come from
 // ffprobe and are cached in a sidecar .json next to each file so repeat launches
