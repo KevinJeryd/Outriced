@@ -61,6 +61,10 @@ target_sources(outriced PRIVATE
     src/platform/tray.cpp
     src/media/player.cpp
     src/app/ui.cpp
+    src/app/ui_common.cpp
+    src/app/ui_library.cpp
+    src/app/ui_preview.cpp
+    src/app/ui_settings.cpp
     src/capture/displays.cpp
     src/capture/encoders.cpp
     src/capture/game_watch.cpp
