@@ -126,13 +126,30 @@ void Player::set_paused(bool paused) {
     paused_ = paused;
 }
 
-void Player::seek_absolute(double seconds) {
+void Player::seek_absolute(double seconds, bool exact) {
     if (!mpv_) return;
     if (seconds < 0) seconds = 0;
     if (duration_ > 0 && seconds > duration_) seconds = duration_;
+
+    if (!exact) {
+        // A drag produces one of these per frame. Even keyframe seeks arrive
+        // faster than mpv retires them, and the backlog is what leaves its
+        // render thread using swapchain resources it has already dropped.
+        const long long now = (long long)GetTickCount64();
+        if (now - last_coarse_seek_ms_ < 60) {
+            position_ = seconds;   // keep the scrub bar responsive regardless
+            return;
+        }
+        last_coarse_seek_ms_ = now;
+    }
+
     char buf[64];
     snprintf(buf, sizeof(buf), "%.3f", seconds);
-    const char* cmd[] = {"seek", buf, "absolute", "exact", nullptr};
+    // "keyframes" jumps to the nearest index point without decoding up to the
+    // target: cheap enough to do repeatedly, and the right trade while the
+    // picture is only being skimmed.
+    const char* cmd[] = {"seek", buf, exact ? "absolute+exact" : "absolute+keyframes",
+                         nullptr};
     mpv_command_async(mpv_, 0, cmd);
     position_ = seconds;  // optimistic, corrected by the next time-pos event
 }
@@ -174,8 +191,19 @@ void Player::set_rect(int x, int y, int w, int h) {
     if (!child_) return;
     if (w < 1) w = 1;
     if (h < 1) h = 1;
-    SetWindowPos((HWND)child_, HWND_TOP, x, y, w, h,
-                 SWP_NOACTIVATE | (visible_ ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+
+    // The caller runs this every frame. Doing nothing when nothing moved is the
+    // point: each SetWindowPos makes mpv's render thread reconsider its D3D11
+    // swapchain, and 60 of those a second while it is presenting is a race.
+    if (rect_set_ && x == rect_x_ && y == rect_y_ && w == rect_w_ && h == rect_h_)
+        return;
+    rect_x_ = x; rect_y_ = y; rect_w_ = w; rect_h_ = h;
+    rect_set_ = true;
+
+    // No HWND_TOP: restacking on every call was pure churn, and visibility is
+    // set_visible's job, so the show and hide flags are gone too.
+    SetWindowPos((HWND)child_, nullptr, x, y, w, h,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
 void Player::set_visible(bool visible) {

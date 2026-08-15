@@ -28,7 +28,13 @@ public:
     void set_paused(bool paused);
     bool paused() const { return paused_; }
 
-    void seek_absolute(double seconds);
+    // `exact` decodes from the preceding keyframe to land on the requested
+    // frame. That is what you want when the seek is final, and far too
+    // expensive to do while a scrub bar is being dragged: on a 67-minute file
+    // each one rebuilds the decoder, and the UI issues one per frame. Dragging
+    // must pass false, then a single exact seek on release. Non-exact seeks are
+    // additionally rate limited, because even keyframe seeks queue up at 60/s.
+    void seek_absolute(double seconds, bool exact = true);
     void step_seconds(double delta);
 
     // 0-100, matching mpv's own scale.
@@ -58,6 +64,13 @@ private:
     bool        paused_   = true;
     bool        visible_  = false;
     double      volume_   = 100.0;
+
+    // Last rectangle actually given to SetWindowPos. mpv binds a D3D11
+    // swapchain to this window, and moving or restacking it every frame while
+    // its render thread is presenting is what the crash reports came from.
+    int         rect_x_ = 0, rect_y_ = 0, rect_w_ = 0, rect_h_ = 0;
+    bool        rect_set_ = false;
+    long long   last_coarse_seek_ms_ = 0;
     bool        muted_    = false;
     std::string error_;
 };

@@ -189,6 +189,12 @@ void draw_preview(Library& lib, AppContext& ctx) {
     const bool scrubbed =
         ImGui::SliderFloat("##scrub", &pos, 0.0f, (float)std::max(0.1, duration), "");
 
+    // Held down versus let go. While the handle is held every frame produces a
+    // new value, so those seeks have to be the cheap kind; the accurate one is
+    // issued once, when the drag ends.
+    const bool scrub_held    = ImGui::IsItemActive();
+    const bool scrub_release = ImGui::IsItemDeactivatedAfterEdit();
+
     const ImVec2 bar_min = ImGui::GetItemRectMin();
     const ImVec2 bar_max = ImGui::GetItemRectMax();
     const bool   bar_hovered = ImGui::IsItemHovered();
@@ -271,7 +277,11 @@ void draw_preview(Library& lib, AppContext& ctx) {
     }
 
     // A drag on a handle must not also scrub the video.
-    if (scrubbed && lib.dragging == 0) player.seek_absolute(pos);
+    if (lib.dragging == 0) {
+        if (scrubbed && scrub_held) player.seek_absolute(pos, /*exact=*/false);
+        else if (scrub_release)     player.seek_absolute(pos, /*exact=*/true);
+        else if (scrubbed)          player.seek_absolute(pos, /*exact=*/true);
+    }
     if (bar_hovered && lib.dragging == 0 && ImGui::IsMouseClicked(1)) {
         // Right-click on the bar sets the nearer edge, which is quicker than
         // driving the playhead to the exact spot first.
