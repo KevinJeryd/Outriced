@@ -77,3 +77,17 @@ if (-not $NoZip) {
     Compress-Archive -Path $dist -DestinationPath $zip -CompressionLevel Optimal
     "Zipped $([math]::Round((Get-Item $zip).Length/1MB,1)) MB -> $zip"
 }
+
+# Symbols go in their own archive rather than the download: users never need
+# them, but a crash dump is unreadable without the .pdb that matches the exact
+# build it came from. Publishing it per release is what makes that possible
+# after the fact, so keep this attached to every tag.
+$pdb = Join-Path $build 'outriced.pdb'
+if (Test-Path $pdb) {
+    $sym = Join-Path $root 'dist\Outriced-symbols.zip'
+    if (Test-Path $sym) { Remove-Item $sym -Force }
+    Compress-Archive -Path $pdb -DestinationPath $sym -CompressionLevel Optimal
+    "Symbols $([math]::Round((Get-Item $sym).Length/1MB,1)) MB -> $sym"
+} else {
+    Write-Warning "outriced.pdb not found in $build - crash dumps from this build will not be traceable."
+}

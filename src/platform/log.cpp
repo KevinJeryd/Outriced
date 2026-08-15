@@ -55,8 +55,15 @@ LONG WINAPI crash_filter(EXCEPTION_POINTERS* info) {
 
         // WithIndirectlyReferencedMemory keeps the dump small but still gives a
         // usable view of the objects the faulting frames were touching.
+        //
+        // WithProcessThreadData is here because the first real crash reports
+        // could not be diagnosed without it: the faulting thread's stack was
+        // captured too sparsely to recover a single caller, so the dumps showed
+        // where execution stopped and nothing about how it got there. It costs a
+        // few MB.
         const auto type = (MINIDUMP_TYPE)(MiniDumpWithIndirectlyReferencedMemory |
                                           MiniDumpScanMemory |
+                                          MiniDumpWithProcessThreadData |
                                           MiniDumpWithThreadInfo);
         MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), f, type,
                           info ? &mei : nullptr, nullptr, nullptr);

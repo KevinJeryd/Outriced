@@ -95,6 +95,18 @@ target_compile_definitions(outriced PRIVATE
 
 if(MSVC)
     target_compile_options(outriced PRIVATE /W4 /permissive-)
+
+    # Symbols in Release too. Without a .pdb a crash dump gives raw addresses
+    # for our own frames and nothing else, which is exactly why the first real
+    # crash reports could not be traced past the faulting instruction.
+    #
+    # /Zi only emits debug information; it does not weaken optimisation. /DEBUG
+    # defaults the linker to /OPT:NOREF, which would leave dead code in the
+    # binary, so the two /OPT flags put that back.
+    target_compile_options(outriced PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(outriced PRIVATE
+        $<$<CONFIG:Release>:/DEBUG> $<$<CONFIG:Release>:/OPT:REF> $<$<CONFIG:Release>:/OPT:ICF>)
+
     # WIN32 executable has no console; use main() as the entry point anyway.
     set_target_properties(outriced PROPERTIES
         VS_DEBUGGER_WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}

@@ -63,7 +63,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Outriced.zip
+          files: |
+            dist/Outriced.zip
+            dist/Outriced-symbols.zip
           generate_release_notes: true
           body: |
             Unzip anywhere and run `outriced.exe`. Nothing to install.
