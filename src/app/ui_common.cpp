@@ -158,6 +158,14 @@ void absorb_scan(Library& lib) {
 
     lib.items = std::move(lib.scanned);
     g_ui.tag_cache_valid = false;   // the tags these items carry just changed
+
+    // Drop anything ticked that is no longer in the folder, so "3 selected"
+    // cannot outlive the files it counted.
+    std::erase_if(lib.marked, [&](const std::filesystem::path& p) {
+        for (const auto& s : lib.items) if (s.file == p) return false;
+        return true;
+    });
+
     lib.selected = -1;
     for (int i = 0; i < (int)lib.items.size(); ++i) {
         if (lib.items[i].file.string() == previous) { lib.selected = i; break; }
@@ -199,13 +207,30 @@ bool delete_video(const std::filesystem::path& file, AppContext& ctx) {
 }
 
 void ask_delete(const Session& s) {
-    g_ui.pending_delete      = s.file;
+    g_ui.pending_delete      = {s.file};
     g_ui.pending_delete_name = s.display_name;
     g_ui.open_delete_popup   = true;
     // Set here rather than derived later: ImGui::IsPopupOpen resolves the name
     // against the current ID stack, so asking outside the window that owns the
     // popup quietly answers "no" and the video never gets out of the way.
     g_ui.modal_active        = true;
+}
+
+bool is_marked(const Library& lib, const std::filesystem::path& file) {
+    for (const auto& p : lib.marked)
+        if (p == file) return true;
+    return false;
+}
+
+void ask_delete_marked(const Library& lib) {
+    if (lib.marked.empty()) return;
+    g_ui.pending_delete = lib.marked;
+    g_ui.pending_delete_name =
+        lib.marked.size() == 1
+            ? lib.marked.front().stem().string()
+            : std::to_string(lib.marked.size()) + " videos";
+    g_ui.open_delete_popup = true;
+    g_ui.modal_active      = true;
 }
 
 } // namespace oc

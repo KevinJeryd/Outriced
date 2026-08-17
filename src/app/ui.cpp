@@ -141,7 +141,9 @@ void draw_ui(AppContext& ctx) {
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Delete file?", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("Permanently delete this file?");
+        const int n_pending = (int)g_ui.pending_delete.size();
+        ImGui::Text(n_pending > 1 ? "Permanently delete these %d files?"
+                                  : "Permanently delete this file?", n_pending);
         ImGui::TextDisabled("%s", g_ui.pending_delete_name.c_str());
         ImGui::TextDisabled("This cannot be undone.");
         ImGui::Separator();
@@ -149,11 +151,20 @@ void draw_ui(AppContext& ctx) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.15f, 0.15f, 1.0f));
         if (ImGui::Button("Delete", px(120, 32))) {
             Library& lib = active_library();
-            const bool ok = delete_video(g_ui.pending_delete, ctx);
-            g_ui.status = ok ? "Deleted " + g_ui.pending_delete_name
-                             : "Could not delete " + g_ui.pending_delete_name +
-                               " (is it open somewhere else?)";
+            // One at a time, counting failures rather than stopping: a file the
+            // player still holds should not prevent the rest from going.
+            int done = 0, failed = 0;
+            for (const auto& p : g_ui.pending_delete) {
+                if (delete_video(p, ctx)) ++done;
+                else                      ++failed;
+            }
+            g_ui.status = failed == 0
+                ? "Deleted " + g_ui.pending_delete_name
+                : "Deleted " + std::to_string(done) + ", could not delete " +
+                  std::to_string(failed) + " (open somewhere else?)";
             lib.view = View::List;
+            lib.marked.clear();
+            lib.selected = -1;
             ctx.player->set_visible(false);
             g_ui.pending_delete.clear();
             g_ui.modal_active = false;

@@ -58,6 +58,12 @@ struct Library {
     // Sessions and Clips tabs filter independently. A video must carry every
     // selected tag, so picking more narrows the list rather than widening it.
     std::vector<std::string> filter_tags;
+
+    // Multi-selection for bulk delete, by path rather than index: a rescan can
+    // reorder or drop items, and an index would then point at a different video
+    // than the one that was ticked. `selected` stays the anchor a shift-click
+    // ranges from, and the video the preview opens.
+    std::vector<std::filesystem::path> marked;
 };
 
 struct UiState {
@@ -70,9 +76,12 @@ struct UiState {
 
     // Delete confirmation. Holds the path rather than an index, so a rescan
     // between asking and confirming cannot delete the wrong file.
-    std::filesystem::path pending_delete;
-    std::string           pending_delete_name;
-    bool                  open_delete_popup = false;
+    // One entry for a single delete, several for a bulk one. Paths rather than
+    // indices so a rescan between asking and confirming cannot delete the wrong
+    // file. `pending_delete_name` is what the dialog says out loud.
+    std::vector<std::filesystem::path> pending_delete;
+    std::string                        pending_delete_name;
+    bool                               open_delete_popup = false;
 
     // True while any modal is up. The video plays in a child window layered over
     // the ImGui surface, so a modal drawn underneath it is invisible while still
@@ -91,6 +100,12 @@ struct UiState {
     // Hotkey capture
     bool     capturing_hotkey = false;
     bool     capturing_marker = false;
+
+    // Bitrate slider swapped for a text field by a double click. The second
+    // flag exists because keyboard focus has to be claimed on the first frame
+    // of the edit only; doing it every frame would fight the mouse.
+    bool     editing_bitrate    = false;
+    bool     bitrate_edit_begin = false;
 
     // Tag being typed in the "Add tag" popup. ImGui's InputText writes into a
     // char buffer, and it has to outlive the frame, so it cannot be a local.
@@ -125,6 +140,9 @@ void     absorb_scan(Library& lib);
 void     open_folder(const std::filesystem::path& dir);
 bool     delete_video(const std::filesystem::path& file, AppContext& ctx);
 void     ask_delete(const Session& s);
+// Bulk delete of whatever is ticked in `lib`. No-op when nothing is.
+void     ask_delete_marked(const Library& lib);
+bool     is_marked(const Library& lib, const std::filesystem::path& file);
 
 // ---- tags ----------------------------------------------------------------
 

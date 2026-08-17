@@ -160,8 +160,31 @@ void section_capture(AppContext& ctx, Settings& d) {
     if (!native_capture && fps_mode_pos == 0 && d.capture_poll_multiplier > 1)
         ImGui::TextDisabled("  Fewer duplicate frames, but no measured gain in smoothness, and more GPU readback.");
 
+    // A slider cannot land on a round number reliably, so a double click swaps
+    // it for a text field. ImGui's own Ctrl+click does the same thing, but
+    // nobody discovers that; a double click is what people try first.
     ImGui::SetNextItemWidth(px(320));
-    ImGui::SliderInt("Recording bitrate (kbps)", &d.session_bitrate_kbps, 4000, 120000);
+    if (g_ui.editing_bitrate) {
+        if (g_ui.bitrate_edit_begin) {          // first frame of the edit
+            ImGui::SetKeyboardFocusHere();
+            g_ui.bitrate_edit_begin = false;
+        }
+        ImGui::InputInt("Recording bitrate (kbps)", &d.session_bitrate_kbps, 0, 0,
+                        ImGuiInputTextFlags_CharsDecimal);
+        // Leaving the field or pressing Enter both deactivate it.
+        if (ImGui::IsItemDeactivated()) {
+            d.session_bitrate_kbps = std::clamp(d.session_bitrate_kbps, 1000, 500000);
+            g_ui.editing_bitrate = false;
+        }
+    } else {
+        ImGui::SliderInt("Recording bitrate (kbps)", &d.session_bitrate_kbps, 4000, 120000);
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            g_ui.editing_bitrate     = true;
+            g_ui.bitrate_edit_begin  = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Double-click to type an exact value");
+    }
     ImGui::TextDisabled("  ~%.0f MB per minute",
                         d.session_bitrate_kbps * 60.0 / 8192.0);
 
