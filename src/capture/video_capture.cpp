@@ -29,6 +29,12 @@ constexpr size_t kMaxQueuedBytes = 48u << 20;
 constexpr size_t kMinQueued      = 4;
 constexpr size_t kMaxQueuedCap   = 24;
 
+// Readback textures in flight. Three gives the GPU two whole frame periods to
+// finish a copy before anything asks to read it, which is what keeps the map
+// from ever blocking. Two would usually do; three costs 4.6 MB at 1080p and
+// removes the edge case where a frame arrives late and the map stalls anyway.
+constexpr int kStagingBuffers = 3;
+
 // How long capture will wait for the writer before giving up on a frame.
 // Dropping is a last resort: rawvideo carries no timestamps, so a dropped
 // frame does not leave a gap in the file, it shortens it. That reads as the
@@ -326,7 +332,9 @@ void VideoCapture::capture_thread(Config cfg) {
     // rather than BGRA, and the video processor has to be told the truth.
     ComPtr<ID3D11Texture2D>                latest;      // newest desktop image
     ComPtr<ID3D11Texture2D>                nv12;        // scaled + converted
-    ComPtr<ID3D11Texture2D>                staging;     // CPU-readable NV12
+    ComPtr<ID3D11Texture2D>                staging[kStagingBuffers];  // CPU-readable NV12
+    bool                                   stage_filled[kStagingBuffers] = {};
+    int                                    stage_next = 0;
     ComPtr<ID3D11VideoProcessor>           vp;
     ComPtr<ID3D11VideoProcessorEnumerator> vpenum;
     ComPtr<ID3D11VideoProcessorOutputView> vpout;
@@ -372,8 +380,13 @@ void VideoCapture::capture_thread(Config cfg) {
         nd.Usage = D3D11_USAGE_STAGING;
         nd.BindFlags = 0;
         nd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (!step("CreateTexture2D(staging)",
-                  device->CreateTexture2D(&nd, nullptr, &staging))) return false;
+        for (int i = 0; i < kStagingBuffers; ++i) {
+            staging[i].Reset();
+            stage_filled[i] = false;
+            if (!step("CreateTexture2D(staging)",
+                      device->CreateTexture2D(&nd, nullptr, &staging[i]))) return false;
+        }
+        stage_next = 0;
 
         D3D11_VIDEO_PROCESSOR_CONTENT_DESC cd{};
         cd.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -524,22 +537,50 @@ void VideoCapture::capture_thread(Config cfg) {
         if (FAILED(vctx->VideoProcessorBlt(vp.Get(), vpout.Get(), 0, 1, &stream)))
             continue;
 
-        ctx->CopyResource(staging.Get(), nv12.Get());
+        // Start this frame's copy to CPU-visible memory, then walk away from it.
+        //
+        // Mapping the texture we just copied into would block until the GPU had
+        // finished every command queued ahead of it, which is a full pipeline
+        // flush on the same GPU the game is drawing with. It costs almost no CPU
+        // -- this thread is asleep inside the driver -- so it does not show up
+        // as load, but it lands as a stall in the game's frame times once per
+        // captured frame. That is what "recording makes it feel stuttery even
+        // though Outriced sits at 3% CPU" was.
+        //
+        // Instead the copies go into a small ring, and each tick collects the
+        // oldest one with DO_NOT_WAIT. By then the GPU has had two extra frames
+        // to finish it, so it is ready and nothing ever waits.
+        ctx->CopyResource(staging[stage_next].Get(), nv12.Get());
+        stage_filled[stage_next] = true;
+        stage_next = (stage_next + 1) % kStagingBuffers;
 
-        D3D11_MAPPED_SUBRESOURCE map{};
-        if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map))) continue;
-
-        const int w = cfg.width, h = cfg.height;
-        scratch.resize((size_t)w * h * 3 / 2);
-        const uint8_t* src = (const uint8_t*)map.pData;
-        uint8_t* dst = scratch.data();
-        for (int y = 0; y < h; ++y)                       // Y plane
-            memcpy(dst + (size_t)y * w, src + (size_t)y * map.RowPitch, w);
-        const uint8_t* uv = src + (size_t)map.RowPitch * h;
-        uint8_t* duv = dst + (size_t)w * h;
-        for (int y = 0; y < h / 2; ++y)                   // interleaved UV
-            memcpy(duv + (size_t)y * w, uv + (size_t)y * map.RowPitch, w);
-        ctx->Unmap(staging.Get(), 0);
+        const int oldest = stage_next;   // one full lap back, so the least recent
+        bool got_bytes = false;
+        if (stage_filled[oldest]) {
+            D3D11_MAPPED_SUBRESOURCE map{};
+            const HRESULT hr = ctx->Map(staging[oldest].Get(), 0, D3D11_MAP_READ,
+                                        D3D11_MAP_FLAG_DO_NOT_WAIT, &map);
+            if (SUCCEEDED(hr)) {
+                const int w = cfg.width, h = cfg.height;
+                scratch.resize((size_t)w * h * 3 / 2);
+                const uint8_t* src = (const uint8_t*)map.pData;
+                uint8_t* dst = scratch.data();
+                for (int y = 0; y < h; ++y)                       // Y plane
+                    memcpy(dst + (size_t)y * w, src + (size_t)y * map.RowPitch, w);
+                const uint8_t* uv = src + (size_t)map.RowPitch * h;
+                uint8_t* duv = dst + (size_t)w * h;
+                for (int y = 0; y < h / 2; ++y)                   // interleaved UV
+                    memcpy(duv + (size_t)y * w, uv + (size_t)y * map.RowPitch, w);
+                ctx->Unmap(staging[oldest].Get(), 0);
+                stage_filled[oldest] = false;
+                got_bytes = true;
+            }
+            // DXGI_ERROR_WAS_STILL_DRAWING: the GPU is behind. Rather than wait
+            // for it, the previous frame's bytes go out again, which is the same
+            // trade the grid already makes when no new desktop frame arrived.
+        }
+        if (scratch.empty()) continue;     // nothing read back yet at all
+        if (!got_bytes) got_new = false;   // a repeat, however new the capture was
 
         {
             std::unique_lock<std::mutex> lk(queue_->m);
